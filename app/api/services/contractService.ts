@@ -25,7 +25,7 @@ function mapDbRuleToCleaningRule(row: typeof cleaningRules.$inferSelect): Cleani
     affectedPercent: parseFloat(row.affectedPercent || "0"),
     parameters: (row.parameters as Record<string, unknown>) || {},
     status: row.status,
-    preview: row.preview as CleaningRule["preview"],
+    preview: (row.preview as CleaningRule["preview"] | null) ?? undefined,
     riskNote: row.riskNote || undefined,
   };
 }

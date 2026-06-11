@@ -38,4 +38,18 @@ describe("auth", () => {
     expect(verifyApiToken(req)).toBe(true);
     expect(() => assertAuthenticated(req)).not.toThrow();
   });
+
+  it("开发环境未配置 APP_SECRET 时 verify 放行", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("APP_SECRET", "");
+    const req = new Request("http://localhost");
+    expect(verifyApiToken(req)).toBe(true);
+  });
+
+  it("已配置 APP_SECRET 时无令牌拒绝", () => {
+    vi.stubEnv("NODE_ENV", "development");
+    vi.stubEnv("APP_SECRET", "dev-secret");
+    const req = new Request("http://localhost");
+    expect(verifyApiToken(req)).toBe(false);
+  });
 });

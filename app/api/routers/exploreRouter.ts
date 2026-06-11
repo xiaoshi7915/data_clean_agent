@@ -17,10 +17,15 @@ const dbConfigSchema = z.object({
 
 export const exploreRouter = createRouter({
   testConnection: protectedMutation
-    .input(z.object({ config: dbConfigSchema }))
+    .input(
+      z.object({
+        config: dbConfigSchema,
+        dbType: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle"]).optional(),
+      })
+    )
     .mutation(async ({ input }) => {
       try {
-        await testDatabaseConnection(input.config);
+        await testDatabaseConnection(input.config, input.dbType ?? "mysql");
         return { success: true };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -29,10 +34,15 @@ export const exploreRouter = createRouter({
     }),
 
   listTables: protectedMutation
-    .input(z.object({ config: dbConfigSchema }))
+    .input(
+      z.object({
+        config: dbConfigSchema,
+        dbType: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle"]).optional(),
+      })
+    )
     .mutation(async ({ input }) => {
       try {
-        const tables = await listDatabaseTables(input.config);
+        const tables = await listDatabaseTables(input.config, input.dbType ?? "mysql");
         return { success: true, tables };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -54,6 +64,7 @@ export const exploreRouter = createRouter({
         }),
         tableName: z.string(),
         limit: z.number().optional().default(100),
+        dbType: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle"]).optional(),
       })
     )
     .mutation(async ({ input }) => {
@@ -63,7 +74,8 @@ export const exploreRouter = createRouter({
           input.sessionId,
           input.config,
           input.tableName,
-          input.limit
+          input.limit,
+          input.dbType ?? "mysql"
         );
 
         // Save to DB

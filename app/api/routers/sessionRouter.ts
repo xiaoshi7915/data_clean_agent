@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { createRouter, publicQuery, protectedMutation } from "../middleware";
+import { createRouter, publicQuery, protectedQuery, protectedMutation } from "../middleware";
 import {
   createSession,
   getSession,
@@ -128,7 +128,7 @@ export const sessionRouter = createRouter({
       return { session, found: !!session };
     }),
 
-  getFull: publicQuery
+  getFull: protectedQuery
     .input(z.object({ sessionId: z.string() }))
     .query(async ({ input }) => {
       const session = await getFullSession(input.sessionId);

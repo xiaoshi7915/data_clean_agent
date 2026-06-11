@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { createRouter, publicQuery, protectedMutation } from "../middleware";
+import { createRouter, publicQuery, protectedQuery, protectedMutation } from "../middleware";
 import {
   exportSessionContractYaml,
   exportSessionContractJson,
@@ -10,7 +10,7 @@ import {
 
 export const contractRouter = createRouter({
   /** 导出会话规则为 YAML 契约 */
-  exportYaml: publicQuery
+  exportYaml: protectedQuery
     .input(z.object({ sessionId: z.string() }))
     .query(async ({ input }) => {
       const yaml = await exportSessionContractYaml(input.sessionId);
@@ -21,7 +21,7 @@ export const contractRouter = createRouter({
     }),
 
   /** 导出会话规则为 JSON 契约 */
-  exportJson: publicQuery
+  exportJson: protectedQuery
     .input(z.object({ sessionId: z.string() }))
     .query(async ({ input }) => {
       const json = await exportSessionContractJson(input.sessionId);

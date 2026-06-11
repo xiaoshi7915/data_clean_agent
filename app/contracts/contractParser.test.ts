@@ -4,8 +4,10 @@ import {
   contractToRules,
   parseCleaningContract,
   rulesToContract,
+  serializeCleaningContractJson,
   serializeCleaningContractYaml,
 } from "./contractParser";
+import { assertContractTemplateValid, CONTRACT_TEMPLATE_YAML } from "./contractTemplate";
 
 const sampleRules: CleaningRule[] = [
   {
@@ -42,5 +44,41 @@ describe("contractParser", () => {
     const yaml = serializeCleaningContractYaml(contract);
     const parsed = parseCleaningContract(yaml, "yaml");
     expect(parsed.rules[0].field).toBe("name");
+  });
+
+  it("rulesToContract 在 preview 为 null 时可导出 YAML/JSON", () => {
+    const rulesWithNullPreview: CleaningRule[] = [
+      {
+        ...sampleRules[0],
+        preview: null as unknown as CleaningRule["preview"],
+      },
+    ];
+
+    const contract = rulesToContract(rulesWithNullPreview);
+    expect(contract.rules[0].preview).toBeUndefined();
+
+    const yaml = serializeCleaningContractYaml(contract);
+    const json = serializeCleaningContractJson(contract);
+    expect(() => parseCleaningContract(yaml, "yaml")).not.toThrow();
+    expect(() => parseCleaningContract(json, "json")).not.toThrow();
+  });
+
+  it("契约模版可解析且可导入", () => {
+    expect(() => assertContractTemplateValid()).not.toThrow();
+    const contract = parseCleaningContract(CONTRACT_TEMPLATE_YAML, "yaml");
+    expect(contract.rules.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("支持 verification 段", () => {
+    const yaml = `
+version: "1.0"
+verification:
+  sodaChecksPath: soda/checks.yml
+  enabled: true
+rules: []
+`;
+    const contract = parseCleaningContract(yaml, "yaml");
+    expect(contract.verification?.sodaChecksPath).toBe("soda/checks.yml");
+    expect(contract.verification?.enabled).toBe(true);
   });
 });

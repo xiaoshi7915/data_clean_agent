@@ -91,7 +91,10 @@ export function DataSourceEditDialog({
     setConnectionStatus("testing");
     setConnectionError("");
     try {
-      const result = await testConnection.mutateAsync({ config: config.dbConfig });
+      const result = await testConnection.mutateAsync({
+        config: config.dbConfig,
+        dbType: config.type as "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle",
+      });
       if (result.success) {
         setConnectionStatus("success");
         toast.success("连接成功");

@@ -4,6 +4,12 @@ export function downloadJsonFile(data: unknown, filename: string) {
   triggerDownload(blob, filename.endsWith(".json") ? filename : `${filename}.json`);
 }
 
+/** 将纯文本下载为本地文件（YAML / SQL 等） */
+export function downloadTextFile(content: string, filename: string, mime = "text/plain;charset=utf-8") {
+  const blob = new Blob([content], { type: mime });
+  triggerDownload(blob, filename);
+}
+
 function triggerDownload(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");

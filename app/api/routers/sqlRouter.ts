@@ -6,7 +6,7 @@ import { updateSessionPhase } from "../services/sessionService";
 import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
 import { getDb } from "../queries/connection";
 import { sqlSteps } from "@db/schema";
-import { isSqlDialectSupported, unsupportedDbMessage } from "@contracts/dataSourceSupport";
+import { isSqlDialectSupported, unsupportedDialectMessage } from "@contracts/dataSourceSupport";
 
 export const sqlRouter = createRouter({
   generate: protectedMutation
@@ -50,7 +50,7 @@ export const sqlRouter = createRouter({
     .mutation(async ({ input }) => {
       try {
         if (!isSqlDialectSupported(input.dialect)) {
-          return { success: false, error: unsupportedDbMessage(input.dialect), result: null };
+          return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
         await validatePhaseTransition(input.sessionId, "generate");
         const result = generateCleaningSQL(

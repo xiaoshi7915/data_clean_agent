@@ -101,6 +101,19 @@ describe("ruleIntentService", () => {
     expect(updates?.every((u) => u.variantKey === "fixed" && u.fillValue === "NULL")).toBe(true);
     expect(updates?.map((u) => u.field).sort()).toEqual(["assi_time", "website"]);
   });
+
+  it("findRuleByField 通过手机号别名匹配 phone 列", () => {
+    const phoneRules: CleaningRule[] = [
+      {
+        ...sampleRules[1],
+        id: "R3",
+        field: "mobile_phone",
+        name: "手机号格式 - mobile_phone",
+      },
+    ];
+    expect(findRuleByField(phoneRules, "手机号")?.field).toBe("mobile_phone");
+    expect(findRuleByField(phoneRules, "电话")?.field).toBe("mobile_phone");
+  });
 });
 
 describe("mergeVariantSelection via applyRuleUpdatesFromNL (unit-level expectations)", () => {

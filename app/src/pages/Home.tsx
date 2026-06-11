@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { createPortal } from "react-dom";
 import { useCleaningSession } from "@/hooks/useCleaningSession";
+import { trpc } from "@/providers/trpc";
+import type { AgentPlanStep } from "@/hooks/usePipeline";
 import { Sidebar } from "@/components/Sidebar";
 import { DataSourceEditDialog } from "@/components/datasource/DataSourceEditDialog";
 import { NewDataSourceDialog } from "@/components/datasource/NewDataSourceDialog";
@@ -14,16 +16,41 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Menu, ArrowRight, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
-import type { ChatMessageAction } from "@contracts/types";
+import type { ChatMessageAction, CleaningPhase } from "@contracts/types";
 
 export default function Home() {
   const session = useCleaningSession();
+  const { data: runtimeConfig } = trpc.artifact.config.useQuery();
+  const scriptOnly = runtimeConfig?.scriptOnly ?? true;
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [openDialog, setOpenDialog] = useState<SessionDialogType>(null);
   const [isChatThinking, setIsChatThinking] = useState(false);
   const [editingDataSourceId, setEditingDataSourceId] = useState<string | null>(null);
   const [newDataSourceOpen, setNewDataSourceOpen] = useState(false);
   const [newConversationSourceId, setNewConversationSourceId] = useState<string | null>(null);
+  const [pendingAgentSteps, setPendingAgentSteps] = useState<AgentPlanStep[]>([]);
+
+  const handlePhaseClick = (phase: CleaningPhase) => {
+    switch (phase) {
+      case "explore":
+        if (session.explorationResult) setOpenDialog("explore");
+        break;
+      case "analyze":
+        if (session.qualityReport) setOpenDialog("quality");
+        break;
+      case "confirm":
+        setOpenDialog("rules");
+        break;
+      case "generate":
+        if (session.generatedSQL) setOpenDialog("sql");
+        else if (session.cleaningRules.length > 0) setOpenDialog("rules");
+        break;
+      case "execute":
+        break;
+      default:
+        break;
+    }
+  };
 
   const handleChatAction = (action: ChatMessageAction) => {
     switch (action.type) {
@@ -34,11 +61,19 @@ export default function Home() {
         session.startExploration();
         break;
       case "runFullPipeline":
-      case "runAgentPlan":
         if (session.dataSource && !session.dataSource.fileConfig && !session.targetTable) {
           setOpenDialog("selectTable");
         } else {
           void session.runFullPipelineToSQL(session.targetTable || undefined).then((ok) => {
+            if (ok) setOpenDialog("sql");
+          });
+        }
+        break;
+      case "runAgentPlan":
+        if (session.dataSource && !session.dataSource.fileConfig && !session.targetTable) {
+          setOpenDialog("selectTable");
+        } else if (pendingAgentSteps.length > 0) {
+          void session.runAgentPlanBySteps(pendingAgentSteps, session.targetTable || undefined).then((ok) => {
             if (ok) setOpenDialog("sql");
           });
         }
@@ -87,6 +122,9 @@ export default function Home() {
     setIsChatThinking(true);
     try {
       const result = await session.sendChatMessage(content);
+      if (result?.agentPlanSteps?.length) {
+        setPendingAgentSteps(result.agentPlanSteps as AgentPlanStep[]);
+      }
       if (result?.autoTrigger && result.action) {
         handleAutoChatAction(result.action);
       }
@@ -168,6 +206,11 @@ export default function Home() {
         onExecuteSQL={session.executeSQL}
         onModifySQL={(stepNum, newSql) => session.modifySQLStep(stepNum, newSql)}
         onExportSQL={exportSQL}
+        onExportArtifactBundle={() => void session.exportArtifactBundle()}
+        scriptOnly={scriptOnly}
+        onExportContractYaml={() => void session.exportContractYaml()}
+        onExportContractJson={() => void session.exportContractJson()}
+        onImportContract={(source, format) => session.importContract(source, format)}
         isLoading={session.isLoading}
         isPipelineRunning={session.isPipelineRunning}
       />
@@ -284,7 +327,7 @@ export default function Home() {
     }
 
     return (
-      <div className="flex flex-1 min-h-0 justify-center">
+      <div className="flex flex-1 min-h-0 min-w-0 justify-center">
         <div className="w-full max-w-3xl flex flex-col min-h-0 h-full border-x bg-card/40 backdrop-blur-sm shadow-sm">
           <ChatPanel
             messages={session.messages}
@@ -341,31 +384,34 @@ export default function Home() {
       </div>
 
       <div className="flex flex-col flex-1 min-w-0">
-        <header className="flex items-center justify-between px-5 py-3.5 border-b bg-card/60 backdrop-blur-md shadow-sm">
-          <div className="flex items-center gap-3 min-w-0">
+        <header className="flex items-center gap-3 px-5 py-3.5 border-b bg-card/60 backdrop-blur-md shadow-sm">
+          <div className="flex items-center gap-3 min-w-0 shrink-0 md:hidden">
             <Sheet>
-              <SheetTrigger asChild className="md:hidden">
+              <SheetTrigger asChild>
                 <Button variant="ghost" size="icon">
                   <Menu className="w-5 h-5" />
                 </Button>
               </SheetTrigger>
             </Sheet>
           </div>
-          <PhaseIndicator
-            currentPhase={session.currentPhase}
-            completedPhases={(() => {
-              const phases: typeof session.currentPhase[] = [];
-              const order = ["explore", "analyze", "confirm", "generate", "execute"];
-              const currentIdx = order.indexOf(session.currentPhase);
-              for (let i = 0; i < currentIdx; i++) {
-                phases.push(order[i] as typeof session.currentPhase);
-              }
-              if (session.currentPhase !== "idle" && session.currentPhase !== "retry") {
-                phases.push(session.currentPhase);
-              }
-              return phases;
-            })()}
-          />
+          <div className="flex flex-1 items-center justify-center min-w-0 overflow-x-auto">
+            <PhaseIndicator
+              currentPhase={session.currentPhase}
+              completedPhases={(() => {
+                const phases: typeof session.currentPhase[] = [];
+                const order = ["explore", "analyze", "confirm", "generate", "execute"];
+                const currentIdx = order.indexOf(session.currentPhase);
+                for (let i = 0; i < currentIdx; i++) {
+                  phases.push(order[i] as typeof session.currentPhase);
+                }
+                if (session.currentPhase !== "idle" && session.currentPhase !== "retry") {
+                  phases.push(session.currentPhase);
+                }
+                return phases;
+              })()}
+              onPhaseClick={session.sessionId ? handlePhaseClick : undefined}
+            />
+          </div>
         </header>
 
         <div className="flex flex-1 min-h-0 overflow-hidden">

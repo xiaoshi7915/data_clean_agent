@@ -36,11 +36,24 @@ interface SQLPanelProps {
   onDryRun: () => void;
   onModify: (stepNumber: number, newSql: string) => void;
   onExport: () => void;
+  onExportBundle?: () => void;
   isLoading: boolean;
   embedded?: boolean;
+  /** SCRIPT_ONLY 模式：隐藏真实执行，显示导出脚本包 */
+  scriptOnly?: boolean;
 }
 
-export function SQLPanel({ sqlResult, onExecute, onDryRun, onModify, onExport, isLoading, embedded }: SQLPanelProps) {
+export function SQLPanel({
+  sqlResult,
+  onExecute,
+  onDryRun,
+  onModify,
+  onExport,
+  onExportBundle,
+  isLoading,
+  embedded,
+  scriptOnly = false,
+}: SQLPanelProps) {
   const [activeTab, setActiveTab] = useState(embedded ? "consolidated" : "overview");
   const [editingStep, setEditingStep] = useState<number | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -116,18 +129,26 @@ export function SQLPanel({ sqlResult, onExecute, onDryRun, onModify, onExport, i
             <Download className="w-3.5 h-3.5" />
             导出SQL
           </Button>
+          {scriptOnly && onExportBundle && (
+            <Button variant="default" size="sm" onClick={onExportBundle} disabled={isLoading} className="gap-1.5">
+              <Download className="w-3.5 h-3.5" />
+              导出脚本包
+            </Button>
+          )}
           <Button variant="outline" size="sm" onClick={onDryRun} disabled={isLoading} className="gap-1.5">
             <TestTube className="w-3.5 h-3.5" />
             模拟执行
           </Button>
-          <Button size="sm" onClick={onExecute} disabled={isLoading} className="gap-1.5">
-            {isLoading ? (
-              <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-            ) : (
-              <Play className="w-3.5 h-3.5" />
-            )}
-            执行清洗
-          </Button>
+          {!scriptOnly && (
+            <Button size="sm" onClick={onExecute} disabled={isLoading} className="gap-1.5">
+              {isLoading ? (
+                <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <Play className="w-3.5 h-3.5" />
+              )}
+              执行清洗
+            </Button>
+          )}
         </div>
       </div>
 
@@ -366,19 +387,27 @@ export function SQLPanel({ sqlResult, onExecute, onDryRun, onModify, onExport, i
           建议在业务低峰期执行，大表操作建议分批执行
         </div>
         <div className="flex gap-2">
+          {scriptOnly && onExportBundle && (
+            <Button onClick={onExportBundle} disabled={isLoading} className="gap-2">
+              <Download className="w-4 h-4" />
+              导出脚本包
+            </Button>
+          )}
           <Button variant="outline" onClick={onDryRun} disabled={isLoading} className="gap-1.5">
             <TestTube className="w-4 h-4" />
             模拟执行
           </Button>
-          <Button onClick={onExecute} disabled={isLoading} className="gap-2">
-            {isLoading ? (
-              <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
-            ) : (
-              <Play className="w-4 h-4" />
-            )}
-            执行清洗
-            <ArrowRight className="w-4 h-4" />
-          </Button>
+          {!scriptOnly && (
+            <Button onClick={onExecute} disabled={isLoading} className="gap-2">
+              {isLoading ? (
+                <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <Play className="w-4 h-4" />
+              )}
+              执行清洗
+              <ArrowRight className="w-4 h-4" />
+            </Button>
+          )}
         </div>
       </div>
     </div>

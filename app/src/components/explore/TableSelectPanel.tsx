@@ -47,7 +47,7 @@ export function TableSelectPanel({
     setLoadError(null);
 
     listTables
-      .mutateAsync({ config: dataSource.dbConfig })
+      .mutateAsync({ config: dataSource.dbConfig, dbType: dataSource.type as "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle" })
       .then((result) => {
         if (cancelled) return;
         if (result.success) {

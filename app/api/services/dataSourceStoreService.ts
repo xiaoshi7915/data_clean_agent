@@ -1,4 +1,5 @@
 import { eq, and, desc } from "drizzle-orm";
+import { encryptCredentialForStorage, decryptCredential } from "../lib/credentialCrypto";
 import { getDb } from "../queries/connection";
 import { savedDataSources, cleaningSessions } from "@db/schema";
 import type { DataSourceConfig } from "@contracts/types";
@@ -24,7 +25,7 @@ function rowToConfig(row: typeof savedDataSources.$inferSelect): DataSourceConfi
       port: row.dbPort || 3306,
       database: row.dbDatabase || "",
       username: row.dbUsername || "",
-      password: row.dbPassword || "",
+      password: decryptCredential(row.dbPassword || ""),
       schema: row.dbSchema || undefined,
     };
   }
@@ -110,7 +111,7 @@ export async function upsertDataSource(config: DataSourceConfig): Promise<string
       .update(savedDataSources)
       .set({
         name: config.name,
-        dbPassword: config.dbConfig?.password ?? null,
+        dbPassword: encryptCredentialForStorage(config.dbConfig?.password),
         updatedAt: new Date(),
       })
       .where(eq(savedDataSources.dataSourceId, existingId));
@@ -127,7 +128,7 @@ export async function upsertDataSource(config: DataSourceConfig): Promise<string
     dbDatabase: config.dbConfig?.database ?? null,
     dbSchema: config.dbConfig?.schema ?? null,
     dbUsername: config.dbConfig?.username ?? null,
-    dbPassword: config.dbConfig?.password ?? null,
+    dbPassword: encryptCredentialForStorage(config.dbConfig?.password),
     fileName: config.fileConfig?.fileName ?? null,
     fileType: config.fileConfig?.fileType ?? null,
     filePath: config.fileConfig?.filePath ?? null,
@@ -171,7 +172,7 @@ export async function updateDataSource(
       dbDatabase: config.dbConfig?.database ?? null,
       dbSchema: config.dbConfig?.schema ?? null,
       dbUsername: config.dbConfig?.username ?? null,
-      dbPassword: config.dbConfig?.password ?? null,
+      dbPassword: encryptCredentialForStorage(config.dbConfig?.password),
       fileName: config.fileConfig?.fileName ?? null,
       fileType: config.fileConfig?.fileType ?? null,
       filePath: config.fileConfig?.filePath ?? null,

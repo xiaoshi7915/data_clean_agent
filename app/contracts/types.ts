@@ -102,6 +102,8 @@ export interface ColumnStats {
   columnName: string;
   dataType: string;
   nullRate: number;
+  /** 空值行数（探查阶段由 MetricRegistry 计算，供质量报告复用） */
+  nullCount?: number;
   uniqueCount: number;
   sampleValues: (string | number | null)[];
   minValue?: string | number;
@@ -151,6 +153,8 @@ export interface QualityReport {
   mediumPriorityIssues: DetectedIssue[];
   lowPriorityIssues: DetectedIssue[];
   summary: string;
+  /** 质量报告引用的已解析指标 cacheKey 列表（MetricRegistry 去重） */
+  metricKeys?: string[];
 }
 
 // ---- Cleaning Rules ----

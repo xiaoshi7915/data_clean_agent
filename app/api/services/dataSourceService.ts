@@ -1,4 +1,11 @@
 import mysql from "mysql2/promise";
+import pg from "pg";
+import type { DatabaseDialect } from "@contracts/types";
+import {
+  createMysqlExecutor,
+  createPostgresExecutor,
+  type SqlExecutor,
+} from "../../engine/execution/sqlExecutor";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { env } from "../lib/env";
@@ -13,15 +20,47 @@ import type {
   ColumnStats,
   DetectedIssue,
   DatabaseTableInfo,
+  DataSourceType,
 } from "@contracts/types";
+import { metricRegistry } from "../../engine/metrics/metricRegistry";
+import { ExplorationMetricCollector } from "../../engine/metrics/metricSqlBuilder";
+import { mysqlDialect } from "../../engine/sql/mysqlDialect";
+import { getDataSourcePlugin } from "../../engine/datasource/plugin";
+import "../../engine/datasource/mysqlPlugin";
+import "../../engine/datasource/postgresPlugin";
 
 // ---- Database Connection Pool (per-session) ----
 
-const connectionPools = new Map<string, mysql.Pool>();
+type SessionDbPool =
+  | { dialect: "mysql"; pool: mysql.Pool }
+  | { dialect: "postgresql"; pool: pg.Pool };
 
-export async function createConnection(sessionId: string, config: DBConnectionConfig): Promise<mysql.Pool> {
-  // Close existing if any
+const connectionPools = new Map<string, SessionDbPool>();
+
+/** 按方言创建会话级连接池 */
+export async function createConnectionForDialect(
+  sessionId: string,
+  config: DBConnectionConfig,
+  dialect: DatabaseDialect = "mysql"
+): Promise<SessionDbPool> {
   await closeConnection(sessionId);
+
+  if (dialect === "postgresql") {
+    const pool = new pg.Pool({
+      host: config.host,
+      port: config.port,
+      database: config.database,
+      user: config.username,
+      password: config.password,
+      connectionTimeoutMillis: 10000,
+      max: 5,
+    });
+    const client = await pool.connect();
+    client.release();
+    const entry: SessionDbPool = { dialect: "postgresql", pool };
+    connectionPools.set(sessionId, entry);
+    return entry;
+  }
 
   const pool = mysql.createPool({
     host: config.host,
@@ -35,23 +74,45 @@ export async function createConnection(sessionId: string, config: DBConnectionCo
     connectTimeout: 10000,
   });
 
-  // Test connection
   const conn = await pool.getConnection();
   conn.release();
 
-  connectionPools.set(sessionId, pool);
-  return pool;
+  const entry: SessionDbPool = { dialect: "mysql", pool };
+  connectionPools.set(sessionId, entry);
+  return entry;
+}
+
+/** 创建 MySQL 连接池（兼容旧调用方） */
+export async function createConnection(sessionId: string, config: DBConnectionConfig): Promise<mysql.Pool> {
+  const entry = await createConnectionForDialect(sessionId, config, "mysql");
+  if (entry.dialect !== "mysql") {
+    throw new Error("内部错误：期望 MySQL 连接池");
+  }
+  return entry.pool;
+}
+
+/** 将会话连接池包装为 SqlExecutor */
+export function createSqlExecutorFromPool(entry: SessionDbPool): SqlExecutor {
+  if (entry.dialect === "postgresql") {
+    return createPostgresExecutor(entry.pool);
+  }
+  return createMysqlExecutor(entry.pool);
 }
 
 export async function closeConnection(sessionId: string): Promise<void> {
-  const pool = connectionPools.get(sessionId);
-  if (pool) {
-    await pool.end();
+  const entry = connectionPools.get(sessionId);
+  if (entry) {
+    await entry.pool.end();
     connectionPools.delete(sessionId);
   }
 }
 
 export function getConnection(sessionId: string): mysql.Pool | undefined {
+  const entry = connectionPools.get(sessionId);
+  return entry?.dialect === "mysql" ? entry.pool : undefined;
+}
+
+export function getConnectionForDialect(sessionId: string): SessionDbPool | undefined {
   return connectionPools.get(sessionId);
 }
 
@@ -84,7 +145,8 @@ function isIdLikeColumn(name: string): boolean {
 
 // ---- Exploration Functions ----
 
-export async function listDatabaseTables(config: DBConnectionConfig): Promise<DatabaseTableInfo[]> {
+/** MySQL 表列表（供 service 与 mysql 插件共用，避免插件 ↔ service 互相委托） */
+export async function listMysqlTables(config: DBConnectionConfig): Promise<DatabaseTableInfo[]> {
   const conn = await mysql.createConnection({
     host: config.host,
     port: config.port,
@@ -114,12 +176,34 @@ export async function listDatabaseTables(config: DBConnectionConfig): Promise<Da
   }
 }
 
+export async function listDatabaseTables(
+  config: DBConnectionConfig,
+  dbType: DataSourceType | string = "mysql"
+): Promise<DatabaseTableInfo[]> {
+  if (dbType === "mysql") {
+    return listMysqlTables(config);
+  }
+
+  const plugin = getDataSourcePlugin(dbType);
+  if (plugin?.listTables) {
+    return plugin.listTables(config);
+  }
+
+  return listMysqlTables(config);
+}
+
 export async function exploreDatabase(
   sessionId: string,
   config: DBConnectionConfig,
   tableName: string,
-  limit: number = 100
+  limit: number = 100,
+  dbType: DataSourceType | string = "mysql"
 ): Promise<ExplorationResult> {
+  const plugin = getDataSourcePlugin(dbType);
+  if (plugin && dbType !== "mysql") {
+    return plugin.explore(config, { sessionId, tableName, limit });
+  }
+
   const safeTable = sanitizeTableName(tableName);
   const safeLimit = sanitizeLimit(limit);
   const quotedTable = quoteIdentifier(safeTable);
@@ -135,10 +219,13 @@ export async function exploreDatabase(
     [config.database, safeTable]
   );
 
-  // Get row count
-  const [countRows] = await pool.query(
-    `SELECT COUNT(*) as cnt FROM ${quotedTable}`
+  // 通过 MetricRegistry 生成行数 SQL，避免与质量报告侧重复定义
+  const metricCollector = new ExplorationMetricCollector(
+    mysqlDialect,
+    safeTable,
+    (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
   );
+  const [countRows] = await pool.query(metricCollector.buildCountSql("row_count"));
   const totalRows = (countRows as { cnt: number }[])[0]?.cnt || 0;
 
   // LIMIT 不能用预处理占位符，MySQL 会报 mysqld_stmt_execute 参数错误
@@ -168,18 +255,16 @@ export async function exploreDatabase(
       maxLength: col.CHARACTER_MAXIMUM_LENGTH || undefined,
     });
 
-    // Get null count
     const quotedCol = quoteIdentifier(col.COLUMN_NAME);
     const [nullResult] = await pool.query(
-      `SELECT COUNT(*) as cnt FROM ${quotedTable} WHERE ${quotedCol} IS NULL`
+      metricCollector.buildCountSql("null_count", col.COLUMN_NAME)
     );
-    const nullCount = (nullResult as { cnt: number }[])[0]?.cnt || 0;
+    const nullCount = Number((nullResult as { cnt: number }[])[0]?.cnt) || 0;
 
-    // Get unique count
     const [uniqueResult] = await pool.query(
-      `SELECT COUNT(DISTINCT ${quotedCol}) as cnt FROM ${quotedTable}`
+      metricCollector.buildCountSql("distinct_count", col.COLUMN_NAME)
     );
-    const uniqueCount = (uniqueResult as { cnt: number }[])[0]?.cnt || 0;
+    const uniqueCount = Number((uniqueResult as { cnt: number }[])[0]?.cnt) || 0;
 
     // Get sample values
     const [sampleResult] = await pool.query(
@@ -193,6 +278,7 @@ export async function exploreDatabase(
       columnName: col.COLUMN_NAME,
       dataType: col.DATA_TYPE,
       nullRate,
+      nullCount,
       uniqueCount,
       sampleValues,
     });
@@ -304,7 +390,8 @@ export function getUploadPath(fileName: string): string {
   return path.join(env.uploadDir, `${Date.now()}_${safeName}`);
 }
 
-export async function testDatabaseConnection(config: DBConnectionConfig): Promise<void> {
+/** MySQL 连接测试（供 service 与 mysql 插件共用） */
+export async function testMysqlConnection(config: DBConnectionConfig): Promise<void> {
   const conn = await mysql.createConnection({
     host: config.host,
     port: config.port,
@@ -318,6 +405,24 @@ export async function testDatabaseConnection(config: DBConnectionConfig): Promis
   } finally {
     await conn.end();
   }
+}
+
+export async function testDatabaseConnection(
+  config: DBConnectionConfig,
+  dbType: DataSourceType | string = "mysql"
+): Promise<void> {
+  if (dbType === "mysql") {
+    await testMysqlConnection(config);
+    return;
+  }
+
+  const plugin = getDataSourcePlugin(dbType);
+  if (plugin) {
+    await plugin.testConnection(config);
+    return;
+  }
+
+  await testMysqlConnection(config);
 }
 
 export async function parseCSVFile(filePath: string, previewRows: number = 100): Promise<ExplorationResult> {

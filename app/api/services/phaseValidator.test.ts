@@ -68,7 +68,7 @@ describe("phaseValidator", () => {
     await expect(validatePhaseTransition("sess_1", "analyze")).rejects.toThrow(/请先完成数据探查/);
   });
 
-  it("非 MySQL 数据库 explore 被拒绝", async () => {
+  it("PostgreSQL 数据库 explore 已支持", async () => {
     mockedGetFullSession.mockResolvedValue(
       mockFullSession({
         currentPhase: "idle",
@@ -78,6 +78,27 @@ describe("phaseValidator", () => {
           dbConfig: {
             host: "localhost",
             port: 5432,
+            database: "app",
+            username: "u",
+            password: "p",
+          },
+        },
+        targetTable: "users",
+      })
+    );
+    await expect(validatePhaseTransition("sess_1", "explore")).resolves.toBeDefined();
+  });
+
+  it("未实现的数据库 explore 被拒绝", async () => {
+    mockedGetFullSession.mockResolvedValue(
+      mockFullSession({
+        currentPhase: "idle",
+        dataSource: {
+          type: "oracle",
+          name: "ora",
+          dbConfig: {
+            host: "localhost",
+            port: 1521,
             database: "app",
             username: "u",
             password: "p",

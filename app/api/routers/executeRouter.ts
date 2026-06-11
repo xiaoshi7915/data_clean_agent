@@ -1,6 +1,7 @@
 import { z } from "zod";
-import { createRouter, protectedMutation } from "../middleware";
-import { isSqlDialectSupported, unsupportedDbMessage } from "@contracts/dataSourceSupport";
+import { createRouter, protectedMutation, rateLimitedMutation } from "../middleware";
+import { isSqlDialectSupported, unsupportedDialectMessage } from "@contracts/dataSourceSupport";
+import { env } from "../lib/env";
 import {
   executeSQLSteps,
   generateRetryContext,
@@ -11,7 +12,7 @@ import { updateSessionPhase, incrementRetryCount } from "../services/sessionServ
 import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
 
 export const executeRouter = createRouter({
-  execute: protectedMutation
+  execute: rateLimitedMutation("execute.run")
     .input(
       z.object({
         sessionId: z.string(),
@@ -48,8 +49,16 @@ export const executeRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
+        if (!input.dryRun && env.scriptOnly && !env.allowExecute) {
+          return {
+            success: false,
+            error:
+              "SCRIPT_ONLY 模式已启用：禁止对生产库执行写操作。请使用 dry-run 模拟执行，或通过「导出脚本包」在本地执行。开发环境可设置 ALLOW_EXECUTE=true 解除限制。",
+            result: null,
+          };
+        }
         if (!isSqlDialectSupported(input.dialect)) {
-          return { success: false, error: unsupportedDbMessage(input.dialect), result: null };
+          return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
         await validatePhaseTransition(input.sessionId, "execute");
         const result = await executeSQLSteps(
@@ -97,6 +106,14 @@ export const executeRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
+        if (!input.dryRun && env.scriptOnly && !env.allowExecute) {
+          return {
+            success: false,
+            error:
+              "SCRIPT_ONLY 模式已启用：禁止对生产库执行文件清洗写操作。请使用 dry-run 或导出脚本包本地执行。设置 ALLOW_EXECUTE=true 可在开发环境解除限制。",
+            result: null,
+          };
+        }
         await validatePhaseTransition(input.sessionId, "execute");
         const result = await executeFileCleaning(
           input.filePath,

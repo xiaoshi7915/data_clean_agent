@@ -1,169 +1,51 @@
-import mysql from "mysql2/promise";
-import { createConnection } from "./dataSourceService";
 import type {
   SQLStep,
   DatabaseDialect,
   ExecutionResult,
-  ExecutionStepResult,
   QualityScore,
   RetryContext,
   RetryOption,
 } from "@contracts/types";
-import { validateSQL, isDangerousOperation } from "./sqlGenerationService";
+import { runSqlSteps } from "../../engine/execution/runSqlSteps";
+import { isSqlDialectSupported, unsupportedDialectMessage } from "@contracts/dataSourceSupport";
+import {
+  createConnectionForDialect,
+  createSqlExecutorFromPool,
+} from "./dataSourceService";
+import { validateSQL } from "./sqlGenerationService";
 
 export async function executeSQLSteps(
   sessionId: string,
   steps: SQLStep[],
   dbConfig: { host: string; port: number; database: string; username: string; password: string },
-  _dialect: DatabaseDialect,
+  dialect: DatabaseDialect,
   dryRun: boolean = false,
   metricsBefore: QualityScore
 ): Promise<ExecutionResult> {
-  const executionId = `exec_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  const stepResults: ExecutionStepResult[] = [];
-  let overallStatus: ExecutionResult["overallStatus"] = "success";
-  let backupTableName: string | undefined;
-  let lastError: string | undefined;
+  if (!isSqlDialectSupported(dialect)) {
+    throw new Error(unsupportedDialectMessage(dialect));
+  }
 
-  const pool = await createConnection(sessionId, dbConfig);
+  const poolEntry = await createConnectionForDialect(sessionId, dbConfig, dialect);
 
   try {
-    for (const step of steps) {
-      const startTime = Date.now();
-
-      try {
-        // Validate SQL
-        const validation = validateSQL(step.sql);
-        if (!validation.valid) {
-          throw new Error(`SQL验证失败: ${validation.errors.join(", ")}`);
-        }
-
-        // Check dangerous operations
-        if (isDangerousOperation(step.sql) && !dryRun) {
-          throw new Error("检测到危险操作，已拦截执行");
-        }
-
-        if (dryRun) {
-          // Dry run: just explain the SQL
-          if (step.operationType === "SELECT" || step.operationType === "CREATE") {
-            const [rows] = await pool.execute(step.sql);
-            stepResults.push({
-              stepNumber: step.stepNumber,
-              name: step.name,
-              status: "success",
-              affectedRows: Array.isArray(rows) ? rows.length : 0,
-              durationMs: Date.now() - startTime,
-            });
-          } else {
-            // For UPDATE/DELETE, try to get estimated count
-            const countSql = step.sql
-              .replace(/UPDATE\s+/i, "SELECT COUNT(*) as cnt FROM ")
-              .replace(/SET\s+.*WHERE/i, "WHERE")
-              .replace(/DELETE\s+FROM/i, "SELECT COUNT(*) as cnt FROM");
-            try {
-              const [countResult] = await pool.execute(countSql);
-              const estimatedRows = (countResult as { cnt: number }[])[0]?.cnt || 0;
-              stepResults.push({
-                stepNumber: step.stepNumber,
-                name: `${step.name} (模拟)`,
-                status: "success",
-                affectedRows: estimatedRows,
-                durationMs: Date.now() - startTime,
-              });
-            } catch {
-              stepResults.push({
-                stepNumber: step.stepNumber,
-                name: `${step.name} (模拟)`,
-                status: "success",
-                affectedRows: step.affectedRows,
-                durationMs: Date.now() - startTime,
-              });
-            }
-          }
-          continue;
-        }
-
-        // Execute the SQL
-        const [result] = await pool.execute(step.sql);
-
-        // Extract affected rows info
-        let affectedRows = 0;
-        if (result && typeof result === "object") {
-          affectedRows = (result as mysql.OkPacket).affectedRows || 0;
-          if (Array.isArray(result)) {
-            affectedRows = result.length;
-          }
-        }
-
-        // Track backup table name
-        if (step.name === "创建备份表" && step.sql.includes("_backup_")) {
-          const match = step.sql.match(/CREATE\s+TABLE\s+(\w+_backup_\w+)/i);
-          if (match) backupTableName = match[1];
-        }
-
-        stepResults.push({
-          stepNumber: step.stepNumber,
-          name: step.name,
-          status: "success",
-          affectedRows,
-          durationMs: Date.now() - startTime,
-        });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        lastError = errorMessage;
-
-        stepResults.push({
-          stepNumber: step.stepNumber,
-          name: step.name,
-          status: "failed",
-          affectedRows: 0,
-          error: errorMessage,
-          durationMs: Date.now() - startTime,
-        });
-
-        overallStatus = step.stepNumber === 0 ? "failed" : "partial";
-
-        // Don't break on partial failure (continue with remaining steps)
-        // unless it's the backup step
-        if (step.stepNumber === 0) {
-          break;
-        }
-      }
-    }
-
-    // Calculate metrics after (simplified)
-    const metricsAfter: QualityScore = { ...metricsBefore };
-    // Adjust scores based on what was cleaned
-    const completedSteps = stepResults.filter((s) => s.status === "success");
-    if (completedSteps.length > 0) {
-      metricsAfter.completeness = Math.min(100, metricsBefore.completeness + 5);
-      metricsAfter.uniqueness = Math.min(100, metricsBefore.uniqueness + 10);
-    }
-
-    return {
-      executionId,
-      overallStatus,
-      stepResults,
+    return await runSqlSteps({
+      sessionId,
+      steps,
+      executor: createSqlExecutorFromPool(poolEntry),
+      dryRun,
       metricsBefore,
-      metricsAfter,
-      backupTableName,
-      startedAt: new Date().toISOString(),
-      completedAt: new Date().toISOString(),
-      error: lastError,
-    };
+    });
   } catch (error) {
     return {
-      executionId,
+      executionId: `exec_${Date.now()}`,
       overallStatus: "failed",
-      stepResults,
+      stepResults: [],
       metricsBefore,
-      backupTableName,
       startedAt: new Date().toISOString(),
       completedAt: new Date().toISOString(),
       error: error instanceof Error ? error.message : String(error),
     };
-  } finally {
-    // Keep connection open for potential retry
   }
 }
 

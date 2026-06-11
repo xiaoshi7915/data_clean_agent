@@ -1,6 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, beforeEach } from "vitest";
 import type { ExplorationResult, QualityReport } from "@contracts/types";
-import { generateCleaningRules } from "./analysisService";
+import { generateCleaningRules, generateQualityReport } from "./analysisService";
+import { metricRegistry } from "../../engine/metrics/metricRegistry";
 
 const emptyReport: QualityReport = {
   score: {
@@ -17,6 +18,50 @@ const emptyReport: QualityReport = {
   lowPriorityIssues: [],
   summary: "test",
 };
+
+describe("generateQualityReport", () => {
+  beforeEach(() => {
+    metricRegistry.clearResolveCache();
+  });
+
+  it("uses MetricRegistry metricKeys and nullCount from exploration", () => {
+    const exploration: ExplorationResult = {
+      sourceType: "mysql",
+      sourceName: "mydb.users",
+      totalRows: 100,
+      totalCols: 2,
+      schema: [],
+      sampleData: [],
+      sampleSize: 0,
+      issues: [],
+      columnStats: [
+        {
+          columnName: "email",
+          dataType: "varchar",
+          nullRate: 10,
+          nullCount: 10,
+          uniqueCount: 90,
+          sampleValues: ["a@b.com"],
+        },
+        {
+          columnName: "name",
+          dataType: "varchar",
+          nullRate: 0,
+          nullCount: 0,
+          uniqueCount: 100,
+          sampleValues: ["Alice"],
+        },
+      ],
+    };
+
+    const report = generateQualityReport(exploration);
+    expect(report.metricKeys).toBeDefined();
+    expect(report.metricKeys!.length).toBeGreaterThanOrEqual(3);
+    expect(report.metricKeys).toContain("row_count|*|users");
+    expect(report.metricKeys).toContain("null_count|email|users");
+    expect(report.score.overall).toBeGreaterThan(0);
+  });
+});
 
 describe("analysisService P1 rule recommendations", () => {
   it("recommends merge for first_name + last_name", () => {
@@ -89,7 +134,7 @@ describe("analysisService P1 rule recommendations", () => {
     expect(crossRule?.parameters.fields).toEqual(["birth_date", "hire_date"]);
   });
 
-  it("includes MICE skeleton with advanced label", () => {
+  it("does not auto-recommend MICE skeleton rules", () => {
     const exploration: ExplorationResult = {
       sourceType: "csv",
       sourceName: "x.csv",
@@ -112,8 +157,6 @@ describe("analysisService P1 rule recommendations", () => {
 
     const rules = generateCleaningRules(exploration, emptyReport);
     const mice = rules.find((r) => r.parameters.type === "mice_impute");
-    expect(mice).toBeDefined();
-    expect(mice?.parameters.recommended).toBe(false);
-    expect(mice?.parameters.advancedLabel).toBe("高级(未启用)");
+    expect(mice).toBeUndefined();
   });
 });

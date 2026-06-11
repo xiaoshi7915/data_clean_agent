@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { eq } from "drizzle-orm";
-import { createRouter, protectedMutation } from "../middleware";
+import { createRouter, rateLimitedMutation } from "../middleware";
 import { getDb } from "../queries/connection";
 import { cleaningRules } from "@db/schema";
 import {
@@ -56,7 +56,7 @@ function loadRulesFromRows(rows: (typeof cleaningRules.$inferSelect)[]): Cleanin
 }
 
 export const chatRouter = createRouter({
-  send: protectedMutation
+  send: rateLimitedMutation("chat.send")
     .input(
       z.object({
         sessionId: z.string().optional(),
@@ -103,6 +103,7 @@ export const chatRouter = createRouter({
         );
 
         const multiIntent = detectMultiIntent(input.userMessage, ctx);
+        let agentPlanSteps: Awaited<ReturnType<typeof runAgentPlan>>["steps"] | undefined;
 
         if (input.sessionId && multiIntent) {
           const agentResult = await runAgentPlan(
@@ -111,6 +112,7 @@ export const chatRouter = createRouter({
             ctx,
             result.ruleUpdates
           );
+          agentPlanSteps = agentResult.steps;
           ruleUpdatesApplied = agentResult.ruleUpdatesApplied;
 
           if (agentResult.executedSteps.includes("updateRule") && agentResult.ruleUpdatesApplied > 0) {
@@ -185,6 +187,7 @@ export const chatRouter = createRouter({
           autoTrigger: result.autoTrigger ?? false,
           usedLlm: result.usedLlm,
           ruleUpdatesApplied,
+          agentPlanSteps,
         };
       } catch (error) {
         const errMessage = error instanceof Error ? error.message : String(error);

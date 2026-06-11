@@ -1,8 +1,11 @@
 services:
+  # 生产模式：镜像内构建，代码变更后需 docker compose up -d --build
   app:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     container_name: data-clean-agent
     ports:
       - "29000:29000"
@@ -15,3 +18,26 @@ services:
     volumes:
       - ./uploads:/app/uploads
     restart: unless-stopped
+
+  # 开发模式：挂载源码 + Vite 热更新，适合频繁改代码
+  app-dev:
+    profiles: ["dev"]
+    image: node:20-alpine
+    container_name: data-clean-agent-dev
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "29000:29000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: development
+      PORT: "29000"
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      - .:/app
+      - app_dev_node_modules:/app/node_modules
+      - ./uploads:/app/uploads
+
+volumes:
+  app_dev_node_modules:

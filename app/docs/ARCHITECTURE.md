@@ -36,6 +36,10 @@ flowchart TB
 | 执行 | `api/services/executionService.ts` | SQL 步骤执行与重试 |
 | 阶段校验 | `api/services/phaseValidator.ts` | explore→execute 前置条件 |
 | 契约 | `api/services/contractService.ts` | 规则 ↔ YAML 契约 round-trip |
+| 引擎 · 指标 | `engine/metrics/metricRegistry.ts` | 质量指标注册与 resolve 去重 |
+| 引擎 · SQL 方言 | `engine/sql/mysqlDialect.ts` | MySQL 标识符引用与备份 DDL |
+| 引擎 · 数据源插件 | `engine/datasource/mysqlPlugin.ts` | MySQL explore/execute 插件契约 |
+| CLI | `cli/index.ts` | `dca` 命令行：explore / compile / execute |
 | 鉴权 | `api/lib/auth.ts` | Bearer `APP_SECRET` 校验 |
 
 ## 前端模块职责
@@ -44,7 +48,7 @@ flowchart TB
 |------|------|------|
 | 会话 Hook | `src/hooks/useCleaningSession.ts` | 阶段驱动、tRPC 调用编排 |
 | 数据源面板 | `src/components/datasource/DataSourcePanel.tsx` | 连接/上传；非 MySQL 显示「即将支持」 |
-| 规则面板 | `src/components/rules/RulesPanel.tsx` | 规则确认与参数编辑 |
+| 规则面板 | `src/components/rules/RulesPanel.tsx` | 规则确认、契约导入/导出 |
 | Chat | `src/components/ChatPanel.tsx` | 对话与快捷动作 |
 | tRPC | `src/providers/trpc.tsx` | 客户端；可选 `VITE_APP_SECRET` 请求头 |
 
@@ -98,8 +102,26 @@ stateDiagram-v2
 | `execution_logs` | 执行记录 |
 | `chat_messages` | 对话历史 |
 
+## 引擎层（Phase 2–3 基础）
+
+```mermaid
+flowchart TB
+  Metrics[engine/metrics<br/>MetricRegistry]
+  Dialect[engine/sql<br/>SqlDialect / MysqlDialect]
+  Plugin[engine/datasource<br/>DataSourcePlugin]
+  CLI[cli/index.ts<br/>dca]
+
+  Metrics --> Analyze[analysisService 未来接入]
+  Dialect --> SQL[sqlGenerationService]
+  Plugin --> DS[dataSourceService]
+  CLI --> Parser[contractParser]
+  CLI --> SQL
+  CLI --> Plugin
+```
+
 ## 扩展点
 
-1. **新数据库驱动**：在 `dataSourceService` 增加驱动，并更新 `contracts/dataSourceSupport.ts`
+1. **新数据库驱动**：实现 `DataSourcePlugin` 并 `registerDataSourcePlugin`，同步 `dataSourceSupport.ts`
 2. **新清洗动作**：注册 `cleaningActionRegistry.ts`，同步 analysis / sql / file 三通道
 3. **契约版本**： bump `cleaning-contract.schema.ts` 的 `version` 字段
+4. **CLI execute**：接入 `executionService` 与 Bearer 鉴权

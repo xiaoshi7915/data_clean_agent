@@ -53,6 +53,14 @@ interface SessionDialogsProps {
   onExecuteSQL: (dryRun: boolean) => void;
   onModifySQL: (stepNum: number, newSql: string) => void;
   onExportSQL: () => void;
+  onExportArtifactBundle?: () => void | Promise<void>;
+  scriptOnly?: boolean;
+  onExportContractYaml?: () => void | Promise<void>;
+  onExportContractJson?: () => void | Promise<void>;
+  onImportContract?: (
+    source: string,
+    format?: "yaml" | "json" | "auto"
+  ) => void | Promise<boolean>;
   isLoading: boolean;
   isPipelineRunning?: boolean;
 }
@@ -80,6 +88,11 @@ export function SessionDialogs({
   onExecuteSQL,
   onModifySQL,
   onExportSQL,
+  onExportArtifactBundle,
+  scriptOnly = true,
+  onExportContractYaml,
+  onExportContractJson,
+  onImportContract,
   isLoading,
   isPipelineRunning = false,
 }: SessionDialogsProps) {
@@ -214,6 +227,9 @@ export function SessionDialogs({
               onDeleteCustomRule={onDeleteCustomRule}
               onConfirmAll={onConfirmAllRules}
               onGenerateSQL={onGenerateSQL}
+              onExportYaml={onExportContractYaml}
+              onExportJson={onExportContractJson}
+              onImportContract={onImportContract}
               isLoading={isLoading}
             />
           </div>
@@ -271,6 +287,7 @@ export function SessionDialogs({
               <SQLPanel
                 embedded
                 sqlResult={generatedSQL}
+                scriptOnly={scriptOnly}
                 onExecute={() => {
                   onClose();
                   onExecuteSQL(false);
@@ -281,6 +298,7 @@ export function SessionDialogs({
                 }}
                 onModify={onModifySQL}
                 onExport={onExportSQL}
+                onExportBundle={() => void onExportArtifactBundle?.()}
                 isLoading={isLoading}
               />
             )}

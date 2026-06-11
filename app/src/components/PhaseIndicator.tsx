@@ -12,6 +12,8 @@ import {
 interface PhaseIndicatorProps {
   currentPhase: CleaningPhase;
   completedPhases: CleaningPhase[];
+  /** 点击已完成或当前阶段时回调（用于打开对应面板） */
+  onPhaseClick?: (phase: CleaningPhase) => void;
 }
 
 const phases: { id: CleaningPhase; label: string; icon: React.ReactNode }[] = [
@@ -22,7 +24,11 @@ const phases: { id: CleaningPhase; label: string; icon: React.ReactNode }[] = [
   { id: "execute", label: "执行", icon: <Play className="w-3.5 h-3.5" /> },
 ];
 
-export function PhaseIndicator({ currentPhase, completedPhases }: PhaseIndicatorProps) {
+export function PhaseIndicator({
+  currentPhase,
+  completedPhases,
+  onPhaseClick,
+}: PhaseIndicatorProps) {
   if (currentPhase === "idle" || currentPhase === "retry") {
     return (
       <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-muted text-xs text-muted-foreground">
@@ -38,16 +44,38 @@ export function PhaseIndicator({ currentPhase, completedPhases }: PhaseIndicator
         const isCompleted = completedPhases.includes(phase.id);
         const isCurrent = currentPhase === phase.id;
 
+        const isClickable = !!onPhaseClick && (isCurrent || isCompleted);
+
         return (
           <div key={phase.id} className="flex items-center">
             <div
+              role={isClickable ? "button" : undefined}
+              tabIndex={isClickable ? 0 : undefined}
+              onClick={isClickable ? () => onPhaseClick(phase.id) : undefined}
+              onKeyDown={
+                isClickable
+                  ? (e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        onPhaseClick(phase.id);
+                      }
+                    }
+                  : undefined
+              }
+              title={
+                isClickable
+                  ? phase.id === "confirm"
+                    ? "打开清洗规则面板"
+                    : `打开${phase.label}相关面板`
+                  : undefined
+              }
               className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium transition-all duration-300 ${
                 isCurrent
                   ? "bg-primary text-primary-foreground shadow-sm"
                   : isCompleted
                   ? "bg-primary/10 text-primary"
                   : "bg-muted text-muted-foreground"
-              }`}
+              } ${isClickable ? "cursor-pointer hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" : ""}`}
             >
               {phase.icon}
               <span className="hidden sm:inline">{phase.label}</span>

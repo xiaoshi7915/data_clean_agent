@@ -1,6 +1,41 @@
-import type { ExplorationResult, QualityReport, QualityScore, CleaningRule, CleaningAction, DetectedIssue } from "@contracts/types";
+import type {
+  ExplorationResult,
+  QualityReport,
+  QualityScore,
+  CleaningRule,
+  CleaningAction,
+  DetectedIssue,
+  ColumnStats,
+} from "@contracts/types";
 import { PLACEHOLDER_NULL_VALUES, type RuleQualityCategory } from "./cleaningActionRegistry";
 import { isPlaceholderNullValue } from "@contracts/cleaningConstants";
+import { metricRegistry } from "../../engine/metrics/metricRegistry";
+/** 复用探查阶段的 nullCount，避免从 nullRate 反算产生舍入误差 */
+function getNonNullCount(column: ColumnStats, totalRows: number): number {
+  const nullCount =
+    column.nullCount ??
+    Math.round((column.nullRate / 100) * totalRows);
+  return Math.max(0, totalRows - nullCount);
+}
+
+/** 质量报告生成时登记 MetricRegistry 引用（resolve 去重） */
+function collectQualityMetricKeys(exploration: ExplorationResult): string[] {
+  const table = exploration.sourceName.includes(".")
+    ? exploration.sourceName.split(".").pop()!
+    : exploration.sourceName;
+  const cacheKeys: string[] = [
+    metricRegistry.resolve("row_count", { table }).cacheKey,
+  ];
+  for (const cs of exploration.columnStats) {
+    cacheKeys.push(
+      metricRegistry.resolve("null_count", { column: cs.columnName, table }).cacheKey
+    );
+    cacheKeys.push(
+      metricRegistry.resolve("distinct_count", { column: cs.columnName, table }).cacheKey
+    );
+  }
+  return [...new Set(cacheKeys)];
+}
 
 function withCategory(
   parameters: Record<string, unknown>,
@@ -189,6 +224,7 @@ const DEFAULT_STATE_TRANSITIONS: Record<string, string[]> = {
 
 export function generateQualityReport(exploration: ExplorationResult): QualityReport {
   const { columnStats, issues, totalRows } = exploration;
+  const metricKeys = collectQualityMetricKeys(exploration);
 
   const completenessScore = calculateCompleteness(columnStats);
   const uniquenessScore = calculateUniqueness(issues, totalRows);
@@ -219,7 +255,10 @@ export function generateQualityReport(exploration: ExplorationResult): QualityRe
 
   const avgNullRate =
     columnStats.length > 0
-      ? columnStats.reduce((sum, cs) => sum + cs.nullRate, 0) / columnStats.length
+      ? columnStats.reduce((sum, cs) => {
+          const nullCount = cs.nullCount ?? Math.round((cs.nullRate / 100) * totalRows);
+          return sum + (totalRows > 0 ? (nullCount / totalRows) * 100 : cs.nullRate);
+        }, 0) / columnStats.length
       : 0;
   const dupIssue = issues.find((i) => i.issueType === "完全重复行");
   const dupRate = totalRows > 0 && dupIssue ? (dupIssue.affectedRows / totalRows) * 100 : 0;
@@ -243,6 +282,7 @@ export function generateQualityReport(exploration: ExplorationResult): QualityRe
     mediumPriorityIssues,
     lowPriorityIssues,
     summary,
+    metricKeys,
   };
 }
 
@@ -680,7 +720,7 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
   for (const cs of exploration.columnStats) {
     const colLower = cs.columnName.toLowerCase();
     const sampleStrs = cs.sampleValues.filter((v): v is string => typeof v === "string");
-    const nonNullCount = exploration.totalRows - Math.round((cs.nullRate / 100) * exploration.totalRows);
+    const nonNullCount = getNonNullCount(cs, exploration.totalRows);
 
     // 去除首尾空格
     if (isStringType(cs.dataType)) {
@@ -1354,28 +1394,8 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
     }
   }
 
-  // P1-25: 高级算法占位（MICE — 注册表标注「高级(未启用)」）
-  addRule({
-    name: "高级缺失值插补 (MICE)",
-    field: "*",
-    action: "fill_null" as CleaningAction,
-    issueDescription: "多变量缺失值插补（需专门建模环境）",
-    strategy: "MICE 多重插补 — 高级(未启用)",
-    affectedRows: 0,
-    affectedPercent: 0,
-    parameters: withCategory(
-      {
-        type: "mice_impute",
-        recommended: false,
-        advancedLabel: "高级(未启用)",
-        enabled: false,
-      },
-      "skeleton"
-    ),
-    status: "pending",
-    riskLevel: "high",
-    riskNote: "高级算法，建议人工评估后启用",
-  });
+  // P1-25: MICE 等高级算法不在自动推荐池中（见 cleaningActionRegistry ADVANCED_AUTO_SKIP_TYPES）
+  // 待 SQL/文件路径实现后再加入 generateCleaningRules。
 
   return rules;
 }

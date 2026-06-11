@@ -9,6 +9,9 @@ export type AgentPlanStep =
   | { type: "updateRule"; ruleUpdates: RuleUpdateIntent[] }
   | { type: "confirmAll" }
   | { type: "generate" }
+  | { type: "verify" }
+  | { type: "scriptGen" }
+  | { type: "exportScripts" }
   | { type: "execute"; dryRun?: boolean };
 
 export interface AgentPlanResult {
@@ -85,6 +88,18 @@ export function parseAgentPlan(
     steps.push({ type: "generate" });
   }
 
+  if (text.includes("校验") || text.includes("verify") || text.includes("验证")) {
+    steps.push({ type: "verify" });
+  }
+
+  if (text.includes("soda") || text.includes("脚本") || text.includes("checks")) {
+    steps.push({ type: "scriptGen" });
+  }
+
+  if (text.includes("导出") && (text.includes("包") || text.includes("bundle") || text.includes("artifact"))) {
+    steps.push({ type: "exportScripts" });
+  }
+
   if (text.includes("模拟") || text.includes("dry")) {
     steps.push({ type: "execute", dryRun: true });
   } else if (text.includes("执行") || text.includes("execute")) {
@@ -138,7 +153,9 @@ export async function runAgentPlan(
   }
 
   const needsFrontend = steps.some((s) =>
-    ["explore", "analyze", "confirmAll", "generate", "execute"].includes(s.type)
+    ["explore", "analyze", "confirmAll", "generate", "verify", "scriptGen", "exportScripts", "execute"].includes(
+      s.type
+    )
   );
 
   const planSummary = steps.map((s) => {
@@ -153,6 +170,12 @@ export async function runAgentPlan(
         return "确认规则";
       case "generate":
         return "生成 SQL";
+      case "verify":
+        return "SQL 校验";
+      case "scriptGen":
+        return "生成 Soda checks";
+      case "exportScripts":
+        return "导出脚本包";
       case "execute":
         return s.dryRun ? "模拟执行" : "执行清洗";
       default: {

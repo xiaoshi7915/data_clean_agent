@@ -99,4 +99,20 @@ describe("sqlGenerationService P1 rule generators", () => {
     expect(result.consolidatedSql).toContain("ENCODING_ERROR");
     expect(result.consolidatedSql).toContain("utf8mb4");
   });
+
+  it("generates PostgreSQL backup and quoted identifiers", () => {
+    const rules = [
+      makeRule({
+        field: "email",
+        action: "format",
+        parameters: { format: "TRIM" },
+      }),
+    ];
+    const result = generateCleaningSQL(rules, "postgresql", "t_users", "app_db", ["email"]);
+    expect(result.targetDialect).toBe("postgresql");
+    expect(result.backupSql).toContain('CREATE TABLE "t_users_backup_');
+    expect(result.backupSql).toContain('SELECT * FROM "t_users"');
+    expect(result.steps[1]?.sql).toContain('CREATE TABLE "t_users_cleaned" (LIKE "t_users" INCLUDING ALL)');
+    expect(result.consolidatedSql).toContain('"email"');
+  });
 });

@@ -30,6 +30,7 @@ export const savedDataSources = mysqlTable("saved_data_sources", {
   dbDatabase: varchar("db_database", { length: 255 }),
   dbSchema: varchar("db_schema", { length: 255 }),
   dbUsername: varchar("db_username", { length: 255 }),
+  /** AES-256-GCM 加密存储（enc:v1: 前缀）；历史明文兼容 */
   dbPassword: varchar("db_password", { length: 512 }),
   fileName: varchar("file_name", { length: 255 }),
   fileType: mysqlEnum("file_type", ["csv", "json", "xml", "xlsx"]),

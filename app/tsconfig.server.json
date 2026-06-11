@@ -17,8 +17,9 @@
     "paths": {
       "@/*": ["./src/*"],
       "@contracts/*": ["./contracts/*"],
-      "@db/*": ["./db/*"]
+      "@db/*": ["./db/*"],
+      "@engine/*": ["./engine/*"]
     }
   },
-  "include": ["api", "contracts", "db"]
+  "include": ["api", "contracts", "db", "engine", "cli"]
 }

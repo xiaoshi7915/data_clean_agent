@@ -7,7 +7,8 @@ import path from "node:path";
 import { appRouter } from "./router";
 import { createContext } from "./context";
 import { env } from "./lib/env";
-import { saveUploadedFile } from "./services/uploadService";
+import { saveUploadedFile, MAX_UPLOAD_BYTES } from "./services/uploadService";
+import { checkRateLimit, rateLimitKeyFromRequest, RateLimitError } from "./lib/rateLimit";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
 
@@ -16,12 +17,29 @@ app.use(bodyLimit({ maxSize: 50 * 1024 * 1024 }));
 // File upload endpoint
 app.post("/api/upload", async (c) => {
   try {
+    const rateKey = rateLimitKeyFromRequest(c.req.raw, "upload");
+    checkRateLimit(rateKey, 30);
+  } catch (error) {
+    if (error instanceof RateLimitError) {
+      return c.json({ success: false, error: error.message }, 429);
+    }
+    throw error;
+  }
+
+  try {
     const formData = await c.req.formData();
     const file = formData.get("file") as File | null;
     const sessionId = formData.get("sessionId") as string | null;
 
     if (!file) {
       return c.json({ success: false, error: "No file provided" }, 400);
+    }
+
+    if (file.size > MAX_UPLOAD_BYTES) {
+      return c.json(
+        { success: false, error: `文件过大，最大允许 ${MAX_UPLOAD_BYTES / (1024 * 1024)}MB` },
+        413
+      );
     }
 
     const result = await saveUploadedFile(

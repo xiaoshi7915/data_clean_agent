@@ -4,7 +4,10 @@ import type {
   SQLStep,
   DatabaseDialect,
 } from "@contracts/types";
+import { mysqlDialect } from "../../engine/sql/mysqlDialect";
+import { postgresDialect } from "../../engine/sql/postgresDialect";
 import { resolveRuleVariant } from "./analysisService";
+import { buildRowCountValidationSql } from "./sqlGenerationMetrics";
 
 export function cleanedTableName(tableName: string): string {
   return `${tableName}_cleaned`;
@@ -115,7 +118,7 @@ export function generateCleaningSQL(
     stepNumber: stepNum,
     name: "验证清洗结果",
     operationType: "SELECT",
-    sql: `SELECT COUNT(*) AS total_rows\nFROM ${quoteTable(outputTableName, dialect)};`,
+    sql: `${buildRowCountValidationSql(outputTableName, dialect)};`,
     affectedRows: 0,
     estimatedTime: "< 1s",
     riskLevel: "low",
@@ -181,7 +184,7 @@ function generatePassthroughSQL(
       stepNumber: 3,
       name: "验证清洗结果",
       operationType: "SELECT",
-      sql: `SELECT COUNT(*) AS total_rows\nFROM ${quotedOutput};`,
+      sql: `${buildRowCountValidationSql(outputTableName, dialect)};`,
       affectedRows: 0,
       estimatedTime: "< 1s",
       riskLevel: "low",
@@ -358,7 +361,7 @@ function buildTransformedExpression(
         expr = applyFormatExpression(expr, rule, dialect);
         break;
       case "standardize":
-        expr = applyStandardizeExpression(expr, rule, dialect, column);
+        expr = applyStandardizeExpression(expr, rule, dialect, column, orderColumn);
         break;
       case "convert_type":
         expr = `CAST(${expr} AS ${rule.parameters.targetType || "VARCHAR(255)"})`;
@@ -534,8 +537,45 @@ function applyStandardizeExpression(
   expr: string,
   rule: CleaningRule,
   dialect: DatabaseDialect,
-  column: string
+  column: string,
+  orderColumn: string
 ): string {
+  if (rule.parameters.type === "mice_impute") {
+    return expr;
+  }
+
+  if (rule.parameters.type === "duplicate_timestamp") {
+    if (dialect === "mysql" || dialect === "postgresql" || dialect === "sqlserver") {
+      return `CASE WHEN COUNT(${expr}) OVER (PARTITION BY ${expr}) > 1 THEN CONCAT(CAST(${expr} AS CHAR), '[DUPLICATE_TIMESTAMP]') ELSE ${expr} END`;
+    }
+    return expr;
+  }
+
+  if (rule.parameters.type === "state_transition") {
+    const transitions = rule.parameters.allowedTransitions as
+      | Record<string, string[]>
+      | undefined;
+    const quotedOrder = `src.${quoteColumn(orderColumn, dialect)}`;
+    if (transitions && (dialect === "mysql" || dialect === "postgresql" || dialect === "sqlserver")) {
+      const prevExpr = `LOWER(TRIM(LAG(${expr}) OVER (ORDER BY ${quotedOrder})))`;
+      const currExpr = `LOWER(TRIM(${expr}))`;
+      const invalidChecks: string[] = [];
+      for (const [fromState, toStates] of Object.entries(transitions)) {
+        const allowed = toStates.map((s) => `'${s.toLowerCase().replace(/'/g, "''")}'`).join(", ");
+        if (allowed.length > 0) {
+          invalidChecks.push(
+            `(${prevExpr} = '${fromState.toLowerCase().replace(/'/g, "''")}' AND ${currExpr} NOT IN (${allowed}))`
+          );
+        }
+      }
+      if (invalidChecks.length > 0) {
+        const invalidCond = invalidChecks.join(" OR ");
+        return `CASE WHEN ${prevExpr} IS NOT NULL AND (${invalidCond}) THEN CONCAT(CAST(${expr} AS CHAR), '[INVALID_STATE_TRANSITION]') ELSE ${expr} END`;
+      }
+    }
+    return expr;
+  }
+
   if (rule.parameters.type === "placeholder_null") {
     const placeholders = (rule.parameters.placeholders as string[] | undefined) ?? [
       "N/A",
@@ -597,7 +637,7 @@ function applyStandardizeExpression(
       return `CONVERT_TZ(${expr}, @@session.time_zone, '+00:00')`;
     }
     if (dialect === "postgresql") {
-      return `(${expr} AT TIME ZONE '${targetTz.replace(/'/g, "''")}')`;
+      return `(${expr} AT TIME ZONE 'UTC' AT TIME ZONE '${targetTz.replace(/'/g, "''")}')`;
     }
     return expr;
   }
@@ -693,11 +733,14 @@ function buildMergeExpression(
     (f) => `COALESCE(CAST(src.${quoteColumn(f, dialect)} AS CHAR), '')`
   );
   if (separator) {
-    const escapedSep = separator.replace(/'/g, "''");
-    if (dialect === "mysql" || dialect === "postgresql" || dialect === "sqlserver") {
-      return `CONCAT_WS('${escapedSep}', ${parts.join(", ")})`;
+    if (dialect === "mysql") {
+      return mysqlDialect.concatWs(separator, parts);
     }
+    const escapedSep = separator.replace(/'/g, "''");
     return `CONCAT_WS('${escapedSep}', ${parts.join(", ")})`;
+  }
+  if (dialect === "mysql") {
+    return mysqlDialect.concat(parts);
   }
   return `CONCAT(${parts.join(", ")})`;
 }
@@ -713,9 +756,9 @@ function indentSql(sql: string, spaces: number): string {
 function generateCreateLikeSQL(dialect: DatabaseDialect, sourceTable: string, targetTable: string): string {
   switch (dialect) {
     case "mysql":
-      return `CREATE TABLE ${quoteTable(targetTable, dialect)} LIKE ${quoteTable(sourceTable, dialect)};`;
+      return mysqlDialect.createTableLikeSql(sourceTable, targetTable);
     case "postgresql":
-      return `CREATE TABLE ${quoteTable(targetTable, dialect)} (LIKE ${quoteTable(sourceTable, dialect)} INCLUDING ALL);`;
+      return postgresDialect.createTableLikeSql(sourceTable, targetTable);
     case "sqlserver":
       return `SELECT * INTO ${quoteTable(targetTable, dialect)}\nFROM ${quoteTable(sourceTable, dialect)}\nWHERE 1 = 0;`;
     case "sqlite":
@@ -728,9 +771,9 @@ function generateCreateLikeSQL(dialect: DatabaseDialect, sourceTable: string, ta
 function quoteTable(table: string, dialect: DatabaseDialect): string {
   switch (dialect) {
     case "mysql":
-      return `\`${table}\``;
+      return mysqlDialect.quoteTable(table);
     case "postgresql":
-      return `"${table}"`;
+      return postgresDialect.quoteTable(table);
     case "sqlserver":
       return `[${table}]`;
     case "sqlite":
@@ -745,9 +788,9 @@ function quoteTable(table: string, dialect: DatabaseDialect): string {
 function quoteColumn(column: string, dialect: DatabaseDialect): string {
   switch (dialect) {
     case "mysql":
-      return `\`${column}\``;
+      return mysqlDialect.quoteIdentifier(column);
     case "postgresql":
-      return `"${column}"`;
+      return postgresDialect.quoteIdentifier(column);
     case "sqlserver":
       return `[${column}]`;
     case "sqlite":
@@ -776,9 +819,9 @@ function formatValue(value: unknown): string {
 function generateBackupSQL(dialect: DatabaseDialect, tableName: string, backupName: string): string {
   switch (dialect) {
     case "mysql":
-      return `CREATE TABLE \`${backupName}\` AS\nSELECT * FROM \`${tableName}\`;`;
+      return mysqlDialect.createBackupSql(tableName, backupName);
     case "postgresql":
-      return `CREATE TABLE "${backupName}" AS\nSELECT * FROM "${tableName}";`;
+      return postgresDialect.createBackupSql(tableName, backupName);
     case "sqlserver":
       return `SELECT * INTO [${backupName}]\nFROM [${tableName}];`;
     case "sqlite":

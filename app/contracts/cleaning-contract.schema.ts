@@ -36,7 +36,7 @@ export const cleaningRuleSchema = z.object({
   affectedPercent: z.number(),
   parameters: z.record(z.string(), z.unknown()),
   status: ruleStatusSchema,
-  preview: rulePreviewSchema.optional(),
+  preview: rulePreviewSchema.nullish(),
   riskNote: z.string().optional(),
   riskLevel: z.enum(["high", "medium", "low"]).optional(),
 });
@@ -50,10 +50,17 @@ export const cleaningContractMetadataSchema = z.object({
   exportedAt: z.string().optional(),
 });
 
+/** 校验/验证配置（Soda checks 等） */
+export const cleaningContractVerificationSchema = z.object({
+  sodaChecksPath: z.string().optional(),
+  enabled: z.boolean().optional(),
+});
+
 /** 清洗契约根对象（YAML/JSON 通用 AST） */
 export const cleaningContractSchema = z.object({
   version: z.string().default("1.0"),
   metadata: cleaningContractMetadataSchema.optional(),
+  verification: cleaningContractVerificationSchema.optional(),
   rules: z.array(cleaningRuleSchema),
 });
 

@@ -94,6 +94,7 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
           username,
           password,
         },
+        dbType: dbType as "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle",
       });
       if (result.success) {
         setConnectionStatus("success");
@@ -202,7 +203,7 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
                 数据库连接配置
               </CardTitle>
               <CardDescription>
-                当前已实现 MySQL 探查与 SQL 执行；其他数据库类型显示为「即将支持」
+                当前已实现 MySQL / PostgreSQL 探查与 SQL 执行；SQLite、SQL Server、Oracle 显示为「即将支持」
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">

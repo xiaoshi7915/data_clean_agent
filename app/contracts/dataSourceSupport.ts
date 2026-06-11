@@ -1,10 +1,10 @@
 import type { DataSourceType, DatabaseDialect, FileType } from "./types";
 
-/** 当前已实现探查/执行的数据库驱动（仅 MySQL） */
-export const SUPPORTED_DB_DRIVER_TYPES: DataSourceType[] = ["mysql"];
+/** 当前已实现探查的数据库驱动 */
+export const SUPPORTED_DB_DRIVER_TYPES: DataSourceType[] = ["mysql", "postgresql"];
 
-/** 当前已实现 SQL 生成的方言 */
-export const SUPPORTED_SQL_DIALECTS: DatabaseDialect[] = ["mysql"];
+/** 当前已实现 SQL 生成/执行的方言 */
+export const SUPPORTED_SQL_DIALECTS: DatabaseDialect[] = ["mysql", "postgresql"];
 
 /** 已实现的文件探查/清洗类型 */
 export const SUPPORTED_FILE_TYPES: FileType[] = ["csv", "json", "xml", "xlsx"];
@@ -39,5 +39,13 @@ export function isFileTypeSupported(type: FileType | string): boolean {
 
 /** 未支持类型的用户提示文案 */
 export function unsupportedDbMessage(type: string): string {
-  return `数据源类型「${type}」的探查与 SQL 执行尚未实现，当前仅支持 MySQL。`;
+  return `数据源类型「${type}」的探查或 SQL 执行尚未实现，当前支持 MySQL / PostgreSQL 探查、生成与执行。`;
+}
+
+/** 未支持 SQL 方言的用户提示文案 */
+export function unsupportedDialectMessage(dialect: string): string {
+  if (isSqlDialectSupported(dialect)) {
+    return `${dialect} 方言已支持 SQL 生成与执行。`;
+  }
+  return `SQL 方言「${dialect}」尚未实现，当前支持 MySQL 与 PostgreSQL。`;
 }

@@ -55,6 +55,29 @@ export function serializeCleaningContractYaml(contract: CleaningContract): strin
   return stringifyYaml(contract, { sortMapEntries: true });
 }
 
+/** 将规则字段序列化为契约条目（省略 DB 中的 null preview 等无效值） */
+function ruleToContractEntry(rule: CleaningRule): CleaningContract["rules"][number] {
+  const entry: CleaningContract["rules"][number] = {
+    id: rule.id,
+    index: rule.index,
+    name: rule.name,
+    field: rule.field,
+    action: rule.action,
+    affectedRows: rule.affectedRows,
+    affectedPercent: rule.affectedPercent,
+    parameters: rule.parameters ?? {},
+    status: rule.status,
+  };
+
+  if (rule.issueDescription != null) entry.issueDescription = rule.issueDescription;
+  if (rule.strategy != null) entry.strategy = rule.strategy;
+  if (rule.preview != null) entry.preview = rule.preview;
+  if (rule.riskNote != null) entry.riskNote = rule.riskNote;
+  if (rule.riskLevel != null) entry.riskLevel = rule.riskLevel;
+
+  return entry;
+}
+
 /** 数据库 cleaning_rules 行 → CleaningContract */
 export function rulesToContract(
   rules: CleaningRule[],
@@ -66,10 +89,7 @@ export function rulesToContract(
       exportedAt: new Date().toISOString(),
       ...metadata,
     },
-    rules: rules.map((rule) => ({
-      ...rule,
-      parameters: rule.parameters ?? {},
-    })),
+    rules: rules.map(ruleToContractEntry),
   });
   return contract;
 }
@@ -80,5 +100,6 @@ export function contractToRules(contract: CleaningContract): CleaningRule[] {
     ...rule,
     index: rule.index ?? idx + 1,
     parameters: rule.parameters ?? {},
+    preview: rule.preview ?? undefined,
   }));
 }

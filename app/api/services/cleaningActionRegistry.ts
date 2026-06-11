@@ -209,11 +209,11 @@ export const PARAMETER_RULE_REGISTRY: Record<string, ParameterRuleDefinition> = 
   mice_impute: {
     type: "mice_impute",
     label: "MICE 多重插补",
-    description: "高级缺失值插补（需专门建模环境）",
+    description: "高级缺失值插补（需专门建模环境，未纳入自动推荐）",
     category: "skeleton",
     sqlSupported: false,
     fileSupported: false,
-    analysisDetector: true,
+    analysisDetector: false,
     recommended: false,
   },
 };

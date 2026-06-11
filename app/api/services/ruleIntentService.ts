@@ -1,4 +1,5 @@
 import { eq, and } from "drizzle-orm";
+import { fieldMatchesAlias, getCanonicalFieldKey } from "@contracts/naturalLanguageAliases";
 import { getDb } from "../queries/connection";
 import { cleaningRules } from "@db/schema";
 import type { CleaningRule, RuleStatus, RuleUpdateIntent } from "@contracts/types";
@@ -96,13 +97,22 @@ function normalizeFieldName(name: string): string {
   return name.toLowerCase().replace(/[\s_-]+/g, "");
 }
 
-/** 按字段名模糊匹配规则（精确 → 包含 → 被包含） */
+/** 按字段名模糊匹配规则（精确 → 别名 → 包含） */
 export function findRuleByField(rules: CleaningRule[], field: string): CleaningRule | undefined {
   const target = normalizeFieldName(field);
   if (!target) return undefined;
 
   const exact = rules.find((r) => normalizeFieldName(r.field) === target);
   if (exact) return exact;
+
+  const canonical = getCanonicalFieldKey(field);
+  if (canonical) {
+    const aliasMatch = rules.find((r) => fieldMatchesAlias(canonical, r.field));
+    if (aliasMatch) return aliasMatch;
+  }
+
+  const aliasDirect = rules.find((r) => fieldMatchesAlias(field, r.field));
+  if (aliasDirect) return aliasDirect;
 
   const partial = rules.find(
     (r) =>
