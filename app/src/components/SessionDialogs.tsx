@@ -34,6 +34,7 @@ interface SessionDialogsProps {
   openDialog: SessionDialogType;
   onClose: () => void;
   onOpenDialog: (dialog: SessionDialogType) => void;
+  sessionId: string;
   dataSource: DataSourceConfig | null;
   targetTable: string;
   onSelectTable: (table: string) => void;
@@ -69,6 +70,7 @@ export function SessionDialogs({
   openDialog,
   onClose,
   onOpenDialog,
+  sessionId,
   dataSource,
   targetTable,
   onSelectTable,
@@ -109,6 +111,7 @@ export function SessionDialogs({
           {dataSource && (
             <TableSelectPanel
               embedded
+              sessionId={sessionId}
               dataSource={dataSource}
               selectedTable={targetTable}
               onSelectTable={onSelectTable}

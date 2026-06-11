@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { createRouter, protectedMutation } from "../middleware";
-import { generateQualityReport, generateCleaningRules } from "../services/analysisService";
+import { runQualityAgent } from "../agents/qualityAgent";
 import { updateSessionPhase } from "../services/sessionService";
 import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
 import { getDb } from "../queries/connection";
@@ -28,10 +28,17 @@ export const analyzeRouter = createRouter({
     .mutation(async ({ input }) => {
       try {
         await validatePhaseTransition(input.sessionId, "analyze");
-        // Cast to proper type
         const exploration = input.explorationResult as ExplorationResult;
-        const report = generateQualityReport(exploration);
-        const rules = generateCleaningRules(exploration, report);
+        const agentResult = runQualityAgent({ sessionId: input.sessionId, exploration });
+        if (!agentResult.success || !agentResult.data) {
+          return {
+            success: false,
+            error: agentResult.error ?? "分析失败",
+            report: null,
+            rules: [],
+          };
+        }
+        const { report, rules } = agentResult.data;
 
         // Save quality report to DB
         const db = getDb();

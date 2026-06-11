@@ -54,6 +54,15 @@ export const cleaningContractMetadataSchema = z.object({
 export const cleaningContractVerificationSchema = z.object({
   sodaChecksPath: z.string().optional(),
   enabled: z.boolean().optional(),
+  engine: z.enum(["sql", "spark", "soda"]).optional(),
+});
+
+/** 脚本产物配置（dbt / Airflow / Deequ 等） */
+export const cleaningContractArtifactsSchema = z.object({
+  includeDbt: z.boolean().optional(),
+  includeScheduling: z.boolean().optional(),
+  dbtModelPath: z.string().optional(),
+  airflowDagPath: z.string().optional(),
 });
 
 /** 清洗契约根对象（YAML/JSON 通用 AST） */
@@ -61,6 +70,7 @@ export const cleaningContractSchema = z.object({
   version: z.string().default("1.0"),
   metadata: cleaningContractMetadataSchema.optional(),
   verification: cleaningContractVerificationSchema.optional(),
+  artifacts: cleaningContractArtifactsSchema.optional(),
   rules: z.array(cleaningRuleSchema),
 });
 

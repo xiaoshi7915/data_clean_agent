@@ -89,7 +89,7 @@ describe("phaseValidator", () => {
     await expect(validatePhaseTransition("sess_1", "explore")).resolves.toBeDefined();
   });
 
-  it("未实现的数据库 explore 被拒绝", async () => {
+  it("Oracle 数据库 explore 已支持", async () => {
     mockedGetFullSession.mockResolvedValue(
       mockFullSession({
         currentPhase: "idle",
@@ -107,7 +107,7 @@ describe("phaseValidator", () => {
         targetTable: "users",
       })
     );
-    await expect(validatePhaseTransition("sess_1", "explore")).rejects.toThrow(/尚未实现/);
+    await expect(validatePhaseTransition("sess_1", "explore")).resolves.toBeDefined();
   });
 
   it("generate 需要至少一条 confirmed 规则", async () => {

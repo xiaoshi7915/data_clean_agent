@@ -1,4 +1,7 @@
 import { useCallback } from "react";
+import { toast } from "sonner";
+import { downloadJsonFile } from "@/lib/downloadReport";
+import { trpc } from "@/providers/trpc";
 import type { CleaningSessionState } from "./cleaningSessionState";
 import type { ChatApi } from "./useChat";
 import { usePipelineRetry } from "./usePipelineRetry";
@@ -41,10 +44,12 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
       exploreFile,
       analyze,
       generateSQL,
+      verifySQL,
       execute,
       executeFile,
       modifySqlStepMut,
       confirmAllRules,
+      exportBundleMut,
     },
     syncPhase,
     refreshLists,
@@ -52,6 +57,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
 
   const { pushMessage } = chat;
   const { handleRetry, applyManualFix } = usePipelineRetry(state, chat);
+  const { data: runtimeConfig } = trpc.artifact.config.useQuery();
+  const scriptOnly = runtimeConfig?.scriptOnly ?? true;
 
   const modifySQLStep = useCallback(
     async (stepNumber: number, newSql: string) => {
@@ -287,62 +294,20 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
           "agent",
           ruleCount === 0
             ? `📈 质量分析完成！\n\n**质量评分：${analyzeResult.report.score.overall}/100**\n\n数据质量良好，无需清洗规则。`
-            : `📈 质量分析完成！\n\n**质量评分：${analyzeResult.report.score.overall}/100**\n\n已生成 **${ruleCount}** 条清洗规则，已自动确认默认策略。`,
+            : `📈 质量分析完成！\n\n**质量评分：${analyzeResult.report.score.overall}/100**\n\n已生成 **${ruleCount}** 条清洗规则，请确认后再生成 SQL。`,
           "confirm",
           [
             { id: "view-quality", label: "查看质量报告", type: "viewQuality" },
             ...(ruleCount > 0
-              ? [{ id: "view-rules", label: "查看清洗规则", type: "viewRules" as const }]
+              ? [
+                  { id: "view-rules", label: "查看清洗规则", type: "viewRules" as const },
+                  { id: "confirm-all", label: "确认全部规则", type: "confirmAll" as const },
+                ]
               : []),
           ]
         );
 
-        await confirmAllRules.mutateAsync({ sessionId });
-        const confirmedRules = rules.map((r) =>
-          r.status === "skipped" ? r : { ...r, status: "confirmed" as const }
-        );
-        setCleaningRules(confirmedRules);
-
-        await syncPhase(sessionId, "generate");
-        const dialect = resolveDialect(dataSource.type);
-        const sqlTableName =
-          resolvedTable ||
-          dataSource.fileConfig?.fileName.replace(/\.[^.]+$/, "") ||
-          "data";
-        const databaseName = dataSource.dbConfig?.database || "default";
-
-        const sqlResult = await generateSQL.mutateAsync({
-          sessionId,
-          rules: confirmedRules,
-          dialect,
-          tableName: sqlTableName,
-          databaseName,
-          columns: exploration.schema.map((c: { name: string }) => c.name),
-        });
-
-        if (!sqlResult.success || !sqlResult.result) {
-          throw new Error(sqlResult.error || "SQL生成失败");
-        }
-
-        setGeneratedSQL(sqlResult.result);
-        const fileHint = dataSource.fileConfig
-          ? `输出文件：${cleanedOutputHint(dataSource)}`
-          : `目标表：${sqlResult.result.targetTable}`;
-        pushMessage(
-          sessionId,
-          "agent",
-          `🚀 一键流程完成！\n\n${fileHint}\n\n共 ${sqlResult.result.steps.length} 个清洗步骤。您仍可查看探查报告、质量报告与清洗规则。`,
-          "generate",
-          [
-            { id: "view-explore", label: "查看探查报告", type: "viewExplore" },
-            { id: "view-quality", label: "查看质量报告", type: "viewQuality" },
-            ...(ruleCount > 0
-              ? [{ id: "view-rules", label: "查看清洗规则", type: "viewRules" as const }]
-              : []),
-            { id: "view-sql", label: "查看清洗SQL", type: "viewSQL" },
-          ]
-        );
-
+        // human_confirm 闸门：不自动 confirmAll，等待用户确认
         await refreshLists();
         return true;
       } catch (err) {
@@ -433,7 +398,13 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
         const result = await execute.mutateAsync({
           sessionId,
           steps: generatedSQL.steps,
-          dbConfig: dataSource.dbConfig,
+          dbConfig: {
+            host: dataSource.dbConfig.host,
+            port: dataSource.dbConfig.port,
+            database: dataSource.dbConfig.database,
+            username: dataSource.dbConfig.username,
+            password: dataSource.dbConfig.password,
+          },
           dialect: resolveDialect(dataSource.type),
           dryRun,
           metricsBefore,
@@ -490,6 +461,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
 
       let localExploration = explorationResult;
       let localRules = cleaningRules;
+      let localGeneratedSQL = generatedSQL;
 
       try {
         for (const step of steps) {
@@ -549,15 +521,63 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
               if (!sqlResult.success || !sqlResult.result) {
                 throw new Error(sqlResult.error || "SQL生成失败");
               }
+              localGeneratedSQL = sqlResult.result;
               setGeneratedSQL(sqlResult.result);
               break;
             }
-            case "verify":
-            case "scriptGen":
-            case "exportScripts":
+            case "verify": {
+              const sqlToVerify = localGeneratedSQL;
+              if (!sqlToVerify) throw new Error("请先完成 SQL 生成");
+              await syncPhase(sessionId, "generate");
+              const verifyResult = await verifySQL.mutateAsync({
+                sessionId,
+                steps: sqlToVerify.steps,
+                dialect: resolveDialect(dataSource.type),
+                dbConfig: dataSource.dbConfig ?? undefined,
+              });
+              if (!verifyResult.success) {
+                throw new Error(verifyResult.error || "SQL 校验失败");
+              }
+              if (!verifyResult.valid) {
+                const failed = verifyResult.stepResults.filter((s) => !s.valid);
+                const detail = failed
+                  .map((s) => `步骤${s.stepNumber}: ${s.errors.join("; ")}`)
+                  .join("\n");
+                throw new Error(`SQL 校验未通过：\n${detail}`);
+              }
+              pushMessage(sessionId, "agent", "✅ SQL 校验通过（静态规则 + EXPLAIN）", "generate");
               break;
+            }
+            case "scriptGen": {
+              // Soda checks 在导出脚本包时由 scriptGenAgent 生成
+              pushMessage(
+                sessionId,
+                "agent",
+                "📋 Soda 校验脚本已就绪，将在导出脚本包时写入 soda/checks.yml",
+                "generate"
+              );
+              break;
+            }
+            case "exportScripts": {
+              const bundleResult = await exportBundleMut.mutateAsync({ sessionId });
+              if (!bundleResult.success || !bundleResult.files) {
+                throw new Error(bundleResult.error || "导出脚本包失败");
+              }
+              downloadJsonFile(
+                { manifest: bundleResult.manifest, files: bundleResult.files },
+                `cleaning-bundle-${sessionId}.json`
+              );
+              toast.success(`脚本包已导出（${bundleResult.files.length} 个文件）`);
+              pushMessage(
+                sessionId,
+                "agent",
+                `📦 脚本包已导出（${bundleResult.files.length} 个文件），请在本地或调度系统执行 cleaning.sql`,
+                "generate"
+              );
+              break;
+            }
             case "execute":
-              await executeSQL(step.dryRun ?? true);
+              await executeSQL(scriptOnly ? true : (step.dryRun ?? true));
               break;
             case "updateRule":
               break;
@@ -596,7 +616,11 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
       exploreFile,
       analyze,
       confirmAllRules,
+      generatedSQL,
       generateSQL,
+      verifySQL,
+      exportBundleMut,
+      scriptOnly,
       executeSQL,
       syncPhase,
       pushMessage,

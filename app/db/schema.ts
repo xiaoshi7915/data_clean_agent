@@ -1,6 +1,5 @@
 import {
   mysqlTable,
-  serial,
   varchar,
   text,
   timestamp,
@@ -9,9 +8,12 @@ import {
   mysqlEnum,
 } from "drizzle-orm/mysql-core";
 
+/** 与 init.sql 一致：INT AUTO_INCREMENT，避免 drizzle-kit push 误判为 serial 类型变更 */
+const autoId = () => int("id").autoincrement().primaryKey();
+
 // ---- Saved Data Sources ----
 export const savedDataSources = mysqlTable("saved_data_sources", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   dataSourceId: varchar("data_source_id", { length: 64 }).notNull().unique(),
   name: varchar("name", { length: 255 }).notNull(),
   type: mysqlEnum("type", [
@@ -41,7 +43,7 @@ export const savedDataSources = mysqlTable("saved_data_sources", {
 
 // ---- Cleaning Sessions ----
 export const cleaningSessions = mysqlTable("cleaning_sessions", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull().unique(),
   dataSourceId: varchar("data_source_id", { length: 64 }),
   sessionTitle: varchar("session_title", { length: 255 }),
@@ -84,7 +86,7 @@ export const cleaningSessions = mysqlTable("cleaning_sessions", {
 
 // ---- Exploration Results ----
 export const explorationResults = mysqlTable("exploration_results", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
   sourceType: varchar("source_type", { length: 50 }).notNull(),
   sourceName: varchar("source_name", { length: 255 }).notNull(),
@@ -99,7 +101,7 @@ export const explorationResults = mysqlTable("exploration_results", {
 
 // ---- Quality Reports ----
 export const qualityReports = mysqlTable("quality_reports", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
   overallScore: int("overall_score").notNull(),
   completenessScore: int("completeness_score").notNull(),
@@ -116,7 +118,7 @@ export const qualityReports = mysqlTable("quality_reports", {
 
 // ---- Cleaning Rules ----
 export const cleaningRules = mysqlTable("cleaning_rules", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
   ruleId: varchar("rule_id", { length: 50 }).notNull(),
   ruleIndex: int("rule_index").notNull(),
@@ -147,7 +149,7 @@ export const cleaningRules = mysqlTable("cleaning_rules", {
 
 // ---- SQL Steps ----
 export const sqlSteps = mysqlTable("sql_steps", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
   stepNumber: int("step_number").notNull(),
   name: varchar("name", { length: 255 }).notNull(),
@@ -162,7 +164,7 @@ export const sqlSteps = mysqlTable("sql_steps", {
 
 // ---- Execution Logs ----
 export const executionLogs = mysqlTable("execution_logs", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
   executionId: varchar("execution_id", { length: 64 }).notNull(),
   overallStatus: mysqlEnum("overall_status", ["pending", "running", "success", "failed", "partial"]).notNull(),
@@ -178,7 +180,7 @@ export const executionLogs = mysqlTable("execution_logs", {
 
 // ---- Chat Messages ----
 export const chatMessages = mysqlTable("chat_messages", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
   messageId: varchar("message_id", { length: 64 }).notNull(),
   role: mysqlEnum("role", ["agent", "user", "system"]).notNull(),
@@ -196,9 +198,32 @@ export const chatMessages = mysqlTable("chat_messages", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
+// ---- Orchestration Runs（多步编排持久化） ----
+export const orchestrationRuns = mysqlTable("orchestration_runs", {
+  id: autoId(),
+  runId: varchar("run_id", { length: 64 }).notNull().unique(),
+  sessionId: varchar("session_id", { length: 64 }).notNull(),
+  state: mysqlEnum("state", [
+    "schema_explore",
+    "quality_analyze",
+    "human_confirm",
+    "repair_generate",
+    "sql_verify",
+    "script_gen",
+    "artifact_export",
+    "external_verify",
+    "done",
+    "failed",
+  ]).notNull().default("schema_explore"),
+  /** 完整 OrchestratorContext JSON 快照 */
+  context: json("context").notNull(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow().onUpdateNow(),
+});
+
 // ---- File Uploads (for local file processing) ----
 export const fileUploads = mysqlTable("file_uploads", {
-  id: serial("id").primaryKey(),
+  id: autoId(),
   sessionId: varchar("session_id", { length: 64 }),
   fileName: varchar("file_name", { length: 255 }).notNull(),
   fileSize: int("file_size").notNull(),
@@ -222,3 +247,4 @@ export type SQLStepRecord = typeof sqlSteps.$inferSelect;
 export type ExecutionLogRecord = typeof executionLogs.$inferSelect;
 export type ChatMessageRecord = typeof chatMessages.$inferSelect;
 export type FileUploadRecord = typeof fileUploads.$inferSelect;
+export type OrchestrationRunRecord = typeof orchestrationRuns.$inferSelect;

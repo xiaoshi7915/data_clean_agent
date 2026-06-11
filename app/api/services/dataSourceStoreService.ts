@@ -1,5 +1,6 @@
 import { eq, and, desc } from "drizzle-orm";
 import { encryptCredentialForStorage, decryptCredential } from "../lib/credentialCrypto";
+import { isPasswordMissing } from "../lib/dataSourceSanitizer";
 import { getDb } from "../queries/connection";
 import { savedDataSources, cleaningSessions } from "@db/schema";
 import type { DataSourceConfig } from "@contracts/types";
@@ -162,6 +163,13 @@ export async function updateDataSource(
 
   if (rows.length === 0) return false;
 
+  const existing = await getDataSourceById(dataSourceId);
+  const incomingPassword = config.dbConfig?.password;
+  const passwordToStore =
+    existing?.dbConfig && isPasswordMissing(incomingPassword)
+      ? existing.dbConfig.password
+      : incomingPassword;
+
   await db
     .update(savedDataSources)
     .set({
@@ -172,7 +180,7 @@ export async function updateDataSource(
       dbDatabase: config.dbConfig?.database ?? null,
       dbSchema: config.dbConfig?.schema ?? null,
       dbUsername: config.dbConfig?.username ?? null,
-      dbPassword: encryptCredentialForStorage(config.dbConfig?.password),
+      dbPassword: encryptCredentialForStorage(passwordToStore),
       fileName: config.fileConfig?.fileName ?? null,
       fileType: config.fileConfig?.fileType ?? null,
       filePath: config.fileConfig?.filePath ?? null,

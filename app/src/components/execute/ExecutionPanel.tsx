@@ -21,20 +21,40 @@ interface ExecutionPanelProps {
   result: ExecutionResult | null;
   onRetry: () => void;
   onExportSQL: () => void;
+  /** SCRIPT_ONLY 模式：提示导出脚本包而非真实执行 */
+  scriptOnly?: boolean;
+  onExportBundle?: () => void;
   isFileSource?: boolean;
 }
 
-export function ExecutionPanel({ result, onRetry, onExportSQL, isFileSource = false }: ExecutionPanelProps) {
+export function ExecutionPanel({
+  result,
+  onRetry,
+  onExportSQL,
+  scriptOnly = false,
+  onExportBundle,
+  isFileSource = false,
+}: ExecutionPanelProps) {
   if (!result) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-4">
         <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
           <Play className="w-8 h-8 text-primary" />
         </div>
-        <h3 className="text-lg font-semibold">准备执行</h3>
-        <p className="text-sm text-muted-foreground">
-          {isFileSource ? "清洗方案已就绪，请点击执行生成 _cleaned 文件" : "SQL已生成，请点击执行按钮开始数据清洗"}
+        <h3 className="text-lg font-semibold">{scriptOnly ? "脚本已就绪" : "准备执行"}</h3>
+        <p className="text-sm text-muted-foreground text-center max-w-md">
+          {scriptOnly
+            ? "请导出脚本包后在本地/调度系统执行"
+            : isFileSource
+              ? "清洗方案已就绪，请点击执行生成 _cleaned 文件"
+              : "SQL已生成，请点击执行按钮开始数据清洗"}
         </p>
+        {scriptOnly && onExportBundle && (
+          <Button onClick={onExportBundle} className="gap-1.5">
+            <Download className="w-3.5 h-3.5" />
+            导出脚本包
+          </Button>
+        )}
       </div>
     );
   }
@@ -112,7 +132,13 @@ export function ExecutionPanel({ result, onRetry, onExportSQL, isFileSource = fa
               重试/修正
             </Button>
           )}
-          {!isFileSource && (
+          {scriptOnly && onExportBundle && (
+            <Button variant="default" onClick={onExportBundle} className="gap-1.5">
+              <Download className="w-3.5 h-3.5" />
+              导出脚本包
+            </Button>
+          )}
+          {!scriptOnly && !isFileSource && (
             <Button variant="outline" onClick={onExportSQL} className="gap-1.5">
               <Download className="w-3.5 h-3.5" />
               导出SQL

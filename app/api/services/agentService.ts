@@ -122,7 +122,8 @@ export function parseAgentPlan(
 }
 
 /**
- * 顺序执行可在服务端完成的步骤；探查/生成/执行由前端 runAgentPlan 继续
+ * @deprecated 多步编排已统一到 orchestrator.handleMultiStepPlan / handleUserMessage。
+ * 仅保留服务端 updateRule 应用与计划解析，供测试与向后兼容。
  */
 export async function runAgentPlan(
   sessionId: string,
@@ -152,11 +153,8 @@ export async function runAgentPlan(
     }
   }
 
-  const needsFrontend = steps.some((s) =>
-    ["explore", "analyze", "confirmAll", "generate", "verify", "scriptGen", "exportScripts", "execute"].includes(
-      s.type
-    )
-  );
+  const frontendSteps = steps.filter((s) => s.type !== "updateRule");
+  const needsFrontend = frontendSteps.length > 0;
 
   const planSummary = steps.map((s) => {
     switch (s.type) {
@@ -187,15 +185,15 @@ export async function runAgentPlan(
 
   const message =
     messages.length > 0
-      ? `${messages.join("。")}。后续步骤：${planSummary.join(" → ")}`
-      : `已为您规划后续步骤：${planSummary.join(" → ")}`;
+      ? `${messages.join("。")}。后续步骤请通过 orchestrator 推进：${planSummary.join(" → ")}`
+      : `已规划步骤（请使用 orchestrator API 推进）：${planSummary.join(" → ")}`;
 
   return {
     steps,
     executedSteps,
     ruleUpdatesApplied,
     message,
-    suggestAction: needsFrontend ? "runAgentPlan" : undefined,
+    suggestAction: needsFrontend ? "runFullPipeline" : undefined,
     inlineRuleUpdates: ruleUpdates,
   };
 }

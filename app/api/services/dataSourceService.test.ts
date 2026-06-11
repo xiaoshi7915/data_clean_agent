@@ -22,7 +22,11 @@ vi.mock("mysql2/promise", () => ({
 
 vi.mock("../../engine/datasource/postgresPlugin", () => ({}));
 
-import { listDatabaseTables, testDatabaseConnection } from "./dataSourceService";
+import {
+  detectFullyDuplicateRowsIssue,
+  listDatabaseTables,
+  testDatabaseConnection,
+} from "./dataSourceService";
 import "../../engine/datasource/mysqlPlugin";
 
 const sampleConfig: DBConnectionConfig = {
@@ -54,5 +58,26 @@ describe("dataSourceService mysql plugin dispatch", () => {
     await expect(testDatabaseConnection(sampleConfig, "mysql")).resolves.toBeUndefined();
     expect(mysqlMocks.createConnection).toHaveBeenCalledTimes(1);
     expect(mysqlMocks.ping).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("detectFullyDuplicateRowsIssue", () => {
+  it("无重复行时返回 null", () => {
+    const rows = [
+      { a: "1", b: "x" },
+      { a: "2", b: "y" },
+    ];
+    expect(detectFullyDuplicateRowsIssue(rows, ["a", "b"], 2)).toBeNull();
+  });
+
+  it("检测到完全重复行组", () => {
+    const rows = [
+      { a: "1", b: "x" },
+      { a: "1", b: "x" },
+      { a: "2", b: "y" },
+    ];
+    const issue = detectFullyDuplicateRowsIssue(rows, ["a", "b"], 3);
+    expect(issue?.issueType).toBe("完全重复行");
+    expect(issue?.affectedRows).toBe(1);
   });
 });

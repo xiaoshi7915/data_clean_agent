@@ -18,6 +18,7 @@ export type ChatActionIntent =
   | "confirmRule"
   | "executeSQL"
   | "dryRunSQL"
+  | "exportScripts"
   | "none";
 
 export interface LlmChatMessage {
@@ -62,6 +63,7 @@ const ACTION_LABELS: Record<ChatActionIntent, string> = {
   confirmRule: "确认规则",
   executeSQL: "执行清洗",
   dryRunSQL: "模拟执行",
+  exportScripts: "导出脚本包",
   none: "",
 };
 

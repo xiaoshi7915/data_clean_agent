@@ -1,6 +1,10 @@
 import { z } from "zod";
 import { createRouter, protectedMutation, publicQuery } from "../middleware";
-import { exportSessionArtifactBundle, buildArtifactBundle } from "../services/artifactService";
+import {
+  exportSessionArtifactBundle,
+  buildArtifactBundle,
+  exportZip,
+} from "../services/artifactService";
 import { parseCleaningContract, contractToRules } from "@contracts/contractParser";
 import { generateCleaningSQL } from "../services/sqlGenerationService";
 import { env } from "../lib/env";
@@ -22,21 +26,39 @@ export const artifactRouter = createRouter({
         tableName: z.string().optional(),
         databaseName: z.string().optional(),
         dialect: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle"]).optional(),
+        includeDbt: z.boolean().optional(),
+        includeScheduling: z.boolean().optional(),
+        asZip: z.boolean().optional(),
       })
     )
     .mutation(async ({ input }) => {
       try {
+        const bundleOptions = {
+          includeDbt: input.includeDbt,
+          includeScheduling: input.includeScheduling,
+        };
+
         if (input.sessionId) {
-          const bundle = await exportSessionArtifactBundle(input.sessionId);
+          const bundle = await exportSessionArtifactBundle(input.sessionId, bundleOptions);
           if (!bundle) {
             return {
               success: false,
               error: "会话不存在或尚未生成可导出的 SQL/规则",
               files: null,
               manifest: null,
+              zipBase64: null,
             };
           }
-          return { success: true, ...bundle, error: undefined };
+          if (input.asZip) {
+            const zipBuffer = await exportZip(bundle);
+            return {
+              success: true,
+              ...bundle,
+              zipBase64: zipBuffer.toString("base64"),
+              error: undefined,
+            };
+          }
+          return { success: true, ...bundle, zipBase64: null, error: undefined };
         }
 
         const contractSource = input.contractYaml ?? input.contractJson;
@@ -72,9 +94,19 @@ export const artifactRouter = createRouter({
           tableName,
           databaseName,
           explorationDataset: `datasource/${databaseName}/default/${tableName}`,
+          options: bundleOptions,
         });
 
-        return { success: true, ...bundle, error: undefined };
+        if (input.asZip) {
+          const zipBuffer = await exportZip(bundle);
+          return {
+            success: true,
+            ...bundle,
+            zipBase64: zipBuffer.toString("base64"),
+            error: undefined,
+          };
+        }
+        return { success: true, ...bundle, zipBase64: null, error: undefined };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         return { success: false, error: message, files: null, manifest: null };

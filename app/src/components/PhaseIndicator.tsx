@@ -14,6 +14,8 @@ interface PhaseIndicatorProps {
   completedPhases: CleaningPhase[];
   /** 点击已完成或当前阶段时回调（用于打开对应面板） */
   onPhaseClick?: (phase: CleaningPhase) => void;
+  /** 点击「重试」时回调（重新开始选表流程） */
+  onRetryClick?: () => void;
 }
 
 const phases: { id: CleaningPhase; label: string; icon: React.ReactNode }[] = [
@@ -28,6 +30,7 @@ export function PhaseIndicator({
   currentPhase,
   completedPhases,
   onPhaseClick,
+  onRetryClick,
 }: PhaseIndicatorProps) {
   if (currentPhase === "idle" || currentPhase === "retry") {
     return (
@@ -92,7 +95,27 @@ export function PhaseIndicator({
       })}
       <div className="flex items-center ml-1">
         <div className="w-4 h-px bg-destructive/40 mx-0.5" />
-        <div className="flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
+        <div
+          role={onRetryClick ? "button" : undefined}
+          tabIndex={onRetryClick ? 0 : undefined}
+          onClick={onRetryClick}
+          onKeyDown={
+            onRetryClick
+              ? (e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onRetryClick();
+                  }
+                }
+              : undefined
+          }
+          title={onRetryClick ? "重新开始选表流程" : undefined}
+          className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive ${
+            onRetryClick
+              ? "cursor-pointer hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              : ""
+          }`}
+        >
           <RotateCcw className="w-3.5 h-3.5" />
           <span className="hidden sm:inline">重试</span>
         </div>

@@ -1,5 +1,6 @@
 # 构建阶段：编译前端与后端
-FROM node:20-alpine AS builder
+# SQLite 插件使用 node:sqlite（Node ≥22.5），运行镜像需 22+
+FROM node:22-alpine AS builder
 
 # 国内/弱网环境可通过 build-arg 切换 registry，默认使用 npmmirror
 ARG NPM_REGISTRY=https://registry.npmmirror.com
@@ -18,7 +19,7 @@ COPY . .
 RUN npm run build
 
 # 运行阶段：生产环境启动
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 
 ARG NPM_REGISTRY=https://registry.npmmirror.com
 

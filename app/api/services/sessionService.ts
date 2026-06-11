@@ -11,9 +11,11 @@ import {
   executionLogs,
 } from "@db/schema";
 import { getDataSourceById, upsertDataSource, findDataSourceByConnection } from "./dataSourceStoreService";
+import { sanitizeDataSourceForClient } from "../lib/dataSourceSanitizer";
 import type {
   CleaningPhase,
   DataSourceConfig,
+  DBConnectionConfig,
   SessionState,
   ChatMessage,
   ChatMessageAction,
@@ -83,6 +85,23 @@ async function buildDataSourceFromSession(
   }
 
   return dataSource;
+}
+
+/** 从会话关联的数据源解析完整数据库凭证（仅服务端内部使用） */
+export async function resolveDbConfigForSession(
+  sessionId: string
+): Promise<DBConnectionConfig | null> {
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(cleaningSessions)
+    .where(eq(cleaningSessions.sessionId, sessionId))
+    .limit(1);
+
+  if (rows.length === 0) return null;
+
+  const dataSource = await buildDataSourceFromSession(rows[0]);
+  return dataSource?.dbConfig ?? null;
 }
 
 export async function createSession(
@@ -157,7 +176,7 @@ export async function getSession(sessionId: string): Promise<SessionState | null
   return {
     sessionId: row.sessionId,
     currentPhase: row.currentPhase as CleaningPhase,
-    dataSource,
+    dataSource: sanitizeDataSourceForClient(dataSource),
     targetTable: row.targetTable || undefined,
     confirmedRules: [],
     lastAction: row.lastAction || "",

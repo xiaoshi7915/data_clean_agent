@@ -58,20 +58,24 @@ export function rulesToSodaChecksYaml(input: {
     }
   }
 
-  const datasetChecks: Array<Record<string, unknown>> = [{ schema: {} }];
-  if (input.qualityReport) {
+  // soda-core 格式：checks 为顶层列表，columns 为字段级检查
+  const datasetChecks: Array<Record<string, unknown>> = [
+    { schema: { name: "schema 一致性检查" } },
+  ];
+  if (input.qualityReport && input.exploration?.totalRows != null) {
     datasetChecks.push({
-      row_count:
-        input.exploration?.totalRows != null
-          ? { warn: { "when less than": Math.max(1, Math.floor(input.exploration.totalRows * 0.9)) } }
-          : {},
+      row_count: {
+        warn: { "when less than": Math.max(1, Math.floor(input.exploration.totalRows * 0.9)) },
+      },
     });
   }
 
   const contract = {
+    data_source: input.dataset,
     dataset: input.dataset,
     columns: columnChecks,
     checks: datasetChecks,
+    filter: {},
   };
 
   return stringifyYaml(contract, { sortMapEntries: true });

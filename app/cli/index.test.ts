@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import path from "node:path";
 import { parseArgs, resolveDialect, loadContractRules } from "./args";
 import { generateCleaningSQL } from "../api/services/sqlGenerationService";
+import { isScriptOnlyExecuteBlocked, SCRIPT_ONLY_EXECUTE_MESSAGE } from "./executeGuard";
 
 describe("cli args", () => {
   it("parseArgs 解析 flag 与键值", () => {
@@ -20,6 +21,30 @@ describe("cli args", () => {
     expect(resolveDialect({ type: "postgresql" }, "mysql")).toBe("postgresql");
     expect(resolveDialect({}, "postgresql")).toBe("postgresql");
     expect(resolveDialect({})).toBe("mysql");
+  });
+});
+
+describe("SCRIPT_ONLY execute guard", () => {
+  it("默认拦截非 dry-run 真实执行", async () => {
+    vi.stubEnv("ALLOW_EXECUTE", "");
+    vi.resetModules();
+    const { isScriptOnlyExecuteBlocked: blocked, SCRIPT_ONLY_EXECUTE_MESSAGE: msg } =
+      await import("./executeGuard");
+    expect(blocked(false)).toBe(true);
+    expect(blocked(true)).toBe(false);
+    expect(msg).toMatch(/SCRIPT_ONLY/);
+  });
+
+  it("ALLOW_EXECUTE=true 时允许真实执行", async () => {
+    vi.stubEnv("ALLOW_EXECUTE", "true");
+    vi.resetModules();
+    const { isScriptOnlyExecuteBlocked: blocked } = await import("./executeGuard");
+    expect(blocked(false)).toBe(false);
+  });
+
+  it("isScriptOnlyExecuteBlocked 与模块级导出一致", () => {
+    vi.stubEnv("ALLOW_EXECUTE", "");
+    expect(SCRIPT_ONLY_EXECUTE_MESSAGE).toContain("dry-run");
   });
 });
 

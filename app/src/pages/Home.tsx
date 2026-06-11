@@ -2,12 +2,13 @@ import { useState } from "react";
 import { createPortal } from "react-dom";
 import { useCleaningSession } from "@/hooks/useCleaningSession";
 import { trpc } from "@/providers/trpc";
-import type { AgentPlanStep } from "@/hooks/usePipeline";
+import type { ChatMessageAction, CleaningPhase } from "@contracts/types";
 import { Sidebar } from "@/components/Sidebar";
 import { DataSourceEditDialog } from "@/components/datasource/DataSourceEditDialog";
 import { NewDataSourceDialog } from "@/components/datasource/NewDataSourceDialog";
 import { NewConversationDialog } from "@/components/datasource/NewConversationDialog";
 import { PhaseIndicator } from "@/components/PhaseIndicator";
+import { OrchestratorProgress } from "@/components/OrchestratorProgress";
 import { ExecutionPanel } from "@/components/execute/ExecutionPanel";
 import { RetryPanel } from "@/components/retry/RetryPanel";
 import { ChatPanel } from "@/components/ChatPanel";
@@ -16,7 +17,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Menu, ArrowRight, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
-import type { ChatMessageAction, CleaningPhase } from "@contracts/types";
 
 export default function Home() {
   const session = useCleaningSession();
@@ -28,7 +28,19 @@ export default function Home() {
   const [editingDataSourceId, setEditingDataSourceId] = useState<string | null>(null);
   const [newDataSourceOpen, setNewDataSourceOpen] = useState(false);
   const [newConversationSourceId, setNewConversationSourceId] = useState<string | null>(null);
-  const [pendingAgentSteps, setPendingAgentSteps] = useState<AgentPlanStep[]>([]);
+  const [orchestratorRunId, setOrchestratorRunId] = useState<string | undefined>();
+  const [orchestratorState, setOrchestratorState] = useState<string | undefined>();
+
+  const { data: orchestratorRuns } = trpc.orchestrator.listBySession.useQuery(
+    { sessionId: session.sessionId! },
+    { enabled: !!session.sessionId, refetchInterval: session.sessionId ? 5000 : false }
+  );
+
+  const activeRun = orchestratorRuns?.runs?.find(
+    (r) => r.state !== "done" && r.state !== "failed"
+  );
+  const displayRunId = orchestratorRunId ?? activeRun?.runId;
+  const displayRunState = orchestratorState ?? activeRun?.state;
 
   const handlePhaseClick = (phase: CleaningPhase) => {
     switch (phase) {
@@ -52,6 +64,12 @@ export default function Home() {
     }
   };
 
+  const handleRetryRestart = () => {
+    void session.restartFromTableSelection().then((ok) => {
+      if (ok) setOpenDialog("selectTable");
+    });
+  };
+
   const handleChatAction = (action: ChatMessageAction) => {
     switch (action.type) {
       case "selectTable":
@@ -70,11 +88,12 @@ export default function Home() {
         }
         break;
       case "runAgentPlan":
+        // 已废弃：多步编排统一走 orchestrator + runFullPipeline
         if (session.dataSource && !session.dataSource.fileConfig && !session.targetTable) {
           setOpenDialog("selectTable");
-        } else if (pendingAgentSteps.length > 0) {
-          void session.runAgentPlanBySteps(pendingAgentSteps, session.targetTable || undefined).then((ok) => {
-            if (ok) setOpenDialog("sql");
+        } else {
+          void session.runFullPipelineToSQL(session.targetTable || undefined).then((ok) => {
+            if (ok) setOpenDialog("rules");
           });
         }
         break;
@@ -105,7 +124,11 @@ export default function Home() {
         setOpenDialog("sql");
         break;
       case "executeSQL":
-        session.executeSQL(false);
+        if (scriptOnly) {
+          void session.exportArtifactBundle();
+        } else {
+          session.executeSQL(false);
+        }
         break;
       case "dryRunSQL":
         session.executeSQL(true);
@@ -122,8 +145,11 @@ export default function Home() {
     setIsChatThinking(true);
     try {
       const result = await session.sendChatMessage(content);
-      if (result?.agentPlanSteps?.length) {
-        setPendingAgentSteps(result.agentPlanSteps as AgentPlanStep[]);
+      if (result?.orchestratorRunId) {
+        setOrchestratorRunId(result.orchestratorRunId);
+      }
+      if (result?.orchestratorState) {
+        setOrchestratorState(result.orchestratorState);
       }
       if (result?.autoTrigger && result.action) {
         handleAutoChatAction(result.action);
@@ -184,6 +210,7 @@ export default function Home() {
         openDialog={openDialog}
         onClose={() => setOpenDialog(null)}
         onOpenDialog={setOpenDialog}
+        sessionId={session.sessionId}
         dataSource={session.dataSource}
         targetTable={session.targetTable}
         onSelectTable={session.setTargetTable}
@@ -270,6 +297,8 @@ export default function Home() {
           <div className="p-6 lg:p-8 max-w-3xl mx-auto">
             <ExecutionPanel
               result={session.executionResult}
+              scriptOnly={scriptOnly}
+              onExportBundle={() => void session.exportArtifactBundle()}
               onRetry={() => {
                 if (session.executionResult?.error && session.generatedSQL) {
                   const failedStep = session.executionResult.stepResults.find((s) => s.status === "failed");
@@ -334,6 +363,15 @@ export default function Home() {
             onSendMessage={handleSendMessage}
             onMessageAction={handleChatAction}
             isLoading={session.isLoading || isChatThinking}
+            actionContext={{
+              currentPhase: session.currentPhase,
+              targetTable: session.targetTable,
+              explorationResult: session.explorationResult,
+              qualityReport: session.qualityReport,
+              cleaningRules: session.cleaningRules,
+              generatedSQL: session.generatedSQL,
+              executionResult: session.executionResult,
+            }}
           />
         </div>
       </div>
@@ -394,7 +432,7 @@ export default function Home() {
               </SheetTrigger>
             </Sheet>
           </div>
-          <div className="flex flex-1 items-center justify-center min-w-0 overflow-x-auto">
+          <div className="flex flex-1 items-center justify-center min-w-0 overflow-x-auto gap-2">
             <PhaseIndicator
               currentPhase={session.currentPhase}
               completedPhases={(() => {
@@ -410,7 +448,14 @@ export default function Home() {
                 return phases;
               })()}
               onPhaseClick={session.sessionId ? handlePhaseClick : undefined}
+              onRetryClick={session.sessionId ? handleRetryRestart : undefined}
             />
+            {session.sessionId && (
+              <OrchestratorProgress
+                runId={displayRunId}
+                state={displayRunState}
+              />
+            )}
           </div>
         </header>
 

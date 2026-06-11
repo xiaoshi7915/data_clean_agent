@@ -5,6 +5,8 @@ import {
   updateSessionTitle,
   incrementRetryCount,
 } from "./sessionService";
+import { MASKED_PASSWORD } from "../lib/dataSourceSanitizer";
+import { getDataSourceById } from "./dataSourceStoreService";
 
 const mockSelect = vi.fn();
 const mockUpdate = vi.fn();
@@ -35,6 +37,8 @@ vi.mock("./dataSourceStoreService", () => ({
   findDataSourceByConnection: vi.fn().mockResolvedValue(null),
 }));
 
+const mockedGetDataSourceById = vi.mocked(getDataSourceById);
+
 function chainTerminal(rows: unknown[]) {
   mockLimit.mockReturnValue(Promise.resolve(rows));
   mockOrderBy.mockReturnValue({ limit: mockLimit });
@@ -62,7 +66,7 @@ describe("sessionService", () => {
       {
         sessionId: "sess_1",
         currentPhase: "explore",
-        dataSourceId: null,
+        dataSourceId: "ds_1",
         dataSourceType: "mysql",
         dataSourceName: "mydb",
         targetTable: "users",
@@ -80,11 +84,24 @@ describe("sessionService", () => {
       },
     ]);
     mockOrderBy.mockReturnValue(Promise.resolve([]));
+    mockedGetDataSourceById.mockResolvedValue({
+      type: "mysql",
+      name: "mydb",
+      dbConfig: {
+        host: "localhost",
+        port: 3306,
+        database: "mydb",
+        username: "root",
+        password: "secret-pass",
+      },
+    });
 
     const session = await getSession("sess_1");
     expect(session?.sessionId).toBe("sess_1");
     expect(session?.currentPhase).toBe("explore");
     expect(session?.targetTable).toBe("users");
+    expect(session?.dataSource?.dbConfig?.password).toBe(MASKED_PASSWORD);
+    expect(session?.dataSource?.dbConfig?.password).not.toBe("secret-pass");
   });
 
   it("updateSessionPhase 调用 update", async () => {

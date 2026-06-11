@@ -353,6 +353,42 @@ export function useSessionList(state: CleaningSessionState, chat: ChatApi) {
     [saveDataSourceMut, refreshLists, setIsLoading, setError]
   );
 
+  const restartFromTableSelection = useCallback(async () => {
+    if (!sessionId) return false;
+    setIsLoading(true);
+    setError(null);
+    try {
+      setTargetTable("");
+      setExplorationResult(null);
+      setQualityReport(null);
+      setCleaningRules([]);
+      setGeneratedSQL(null);
+      setExecutionResult(null);
+      setRetryContext(null);
+      setRetryCount(0);
+      await syncPhase(sessionId, "explore");
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重置流程失败");
+      return false;
+    } finally {
+      setIsLoading(false);
+    }
+  }, [
+    sessionId,
+    syncPhase,
+    setTargetTable,
+    setExplorationResult,
+    setQualityReport,
+    setCleaningRules,
+    setGeneratedSQL,
+    setExecutionResult,
+    setRetryContext,
+    setRetryCount,
+    setIsLoading,
+    setError,
+  ]);
+
   return {
     loadSession,
     deleteSessionById,
@@ -361,5 +397,6 @@ export function useSessionList(state: CleaningSessionState, chat: ChatApi) {
     saveDataSourceOnly,
     resetSessionState,
     refreshLists,
+    restartFromTableSelection,
   };
 }

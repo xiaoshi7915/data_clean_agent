@@ -61,6 +61,7 @@ export function useCleaningSessionState() {
   const updateRule = trpc.rules.updateStatus.useMutation();
   const confirmAllRules = trpc.rules.confirmAll.useMutation();
   const generateSQL = trpc.sql.generate.useMutation();
+  const verifySQL = trpc.sql.verify.useMutation();
   const execute = trpc.execute.execute.useMutation();
   const executeFile = trpc.execute.executeFile.useMutation();
   const getRetryCtx = trpc.execute.getRetryContext.useMutation();
@@ -181,6 +182,7 @@ export function useCleaningSessionState() {
       updateRule,
       confirmAllRules,
       generateSQL,
+      verifySQL,
       execute,
       executeFile,
       getRetryCtx,

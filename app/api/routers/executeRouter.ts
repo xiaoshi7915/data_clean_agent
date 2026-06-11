@@ -9,6 +9,7 @@ import {
 } from "../services/executionService";
 import { executeFileCleaning } from "../services/fileCleaningService";
 import { updateSessionPhase, incrementRetryCount } from "../services/sessionService";
+import { resolveDbConfigInput } from "../services/sessionCredentialService";
 import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
 
 export const executeRouter = createRouter({
@@ -28,13 +29,15 @@ export const executeRouter = createRouter({
             rollbackSql: z.string().optional(),
           })
         ),
-        dbConfig: z.object({
-          host: z.string(),
-          port: z.number(),
-          database: z.string(),
-          username: z.string(),
-          password: z.string(),
-        }),
+        dbConfig: z
+          .object({
+            host: z.string(),
+            port: z.number(),
+            database: z.string(),
+            username: z.string(),
+            password: z.string(),
+          })
+          .optional(),
         dialect: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle"]),
         dryRun: z.boolean().optional().default(false),
         metricsBefore: z.object({
@@ -61,10 +64,11 @@ export const executeRouter = createRouter({
           return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
         await validatePhaseTransition(input.sessionId, "execute");
+        const resolvedDbConfig = await resolveDbConfigInput(input.sessionId, input.dbConfig);
         const result = await executeSQLSteps(
           input.sessionId,
           input.steps,
-          input.dbConfig,
+          resolvedDbConfig,
           input.dialect,
           input.dryRun,
           input.metricsBefore

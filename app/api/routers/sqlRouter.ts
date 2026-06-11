@@ -1,12 +1,35 @@
 import { z } from "zod";
 import { eq, and } from "drizzle-orm";
 import { createRouter, protectedMutation } from "../middleware";
-import { generateCleaningSQL, validateSQL } from "../services/sqlGenerationService";
+import { validateSQL } from "../services/sqlGenerationService";
+import { runRepairAgent } from "../agents/repairAgent";
+import { runVerifyAgent } from "../agents/verifyAgent";
 import { updateSessionPhase } from "../services/sessionService";
+import { resolveDbConfigInput } from "../services/sessionCredentialService";
 import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
 import { getDb } from "../queries/connection";
 import { sqlSteps } from "@db/schema";
 import { isSqlDialectSupported, unsupportedDialectMessage } from "@contracts/dataSourceSupport";
+
+const sqlStepSchema = z.object({
+  stepNumber: z.number(),
+  name: z.string(),
+  operationType: z.enum(["CREATE", "UPDATE", "DELETE", "INSERT", "SELECT"]),
+  sql: z.string(),
+  affectedRows: z.number(),
+  estimatedTime: z.string().optional(),
+  riskLevel: z.enum(["high", "medium", "low"]),
+  rollbackSql: z.string().optional(),
+});
+
+const dbConfigSchema = z.object({
+  host: z.string(),
+  port: z.number(),
+  database: z.string(),
+  username: z.string(),
+  password: z.string(),
+  schema: z.string().optional(),
+});
 
 export const sqlRouter = createRouter({
   generate: protectedMutation
@@ -53,18 +76,23 @@ export const sqlRouter = createRouter({
           return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
         await validatePhaseTransition(input.sessionId, "generate");
-        const result = generateCleaningSQL(
-          input.rules.map((r) => ({
+        const agentResult = runRepairAgent({
+          sessionId: input.sessionId,
+          rules: input.rules.map((r) => ({
             ...r,
             issueDescription: r.issueDescription ?? "",
             strategy: r.strategy ?? "",
             parameters: r.parameters ?? {},
           })),
-          input.dialect,
-          input.tableName,
-          input.databaseName,
-          input.columns ?? []
-        );
+          dialect: input.dialect,
+          tableName: input.tableName,
+          databaseName: input.databaseName,
+          columns: input.columns ?? [],
+        });
+        if (!agentResult.success || !agentResult.data) {
+          return { success: false, error: agentResult.error ?? "SQL生成失败", result: null };
+        }
+        const result = agentResult.data.sqlResult;
 
         // Save SQL steps to DB
         const db = getDb();
@@ -101,6 +129,55 @@ export const sqlRouter = createRouter({
     .mutation(({ input }) => {
       const result = validateSQL(input.sql);
       return result;
+    }),
+
+  /** SQL 步骤校验：静态规则 + 可选 EXPLAIN（经 verifyAgent） */
+  verify: protectedMutation
+    .input(
+      z.object({
+        sessionId: z.string(),
+        steps: z.array(sqlStepSchema),
+        dialect: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle"]),
+        dbConfig: dbConfigSchema.optional(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      try {
+        if (!isSqlDialectSupported(input.dialect)) {
+          return {
+            success: false,
+            valid: false,
+            stepResults: [],
+            error: unsupportedDialectMessage(input.dialect),
+          };
+        }
+        const resolvedDbConfig = input.dbConfig
+          ? await resolveDbConfigInput(input.sessionId, input.dbConfig)
+          : await resolveDbConfigInput(input.sessionId, undefined);
+        const agentResult = await runVerifyAgent({
+          sessionId: input.sessionId,
+          steps: input.steps,
+          dialect: input.dialect,
+          dbConfig: resolvedDbConfig,
+        });
+        if (!agentResult.success || !agentResult.data) {
+          return {
+            success: false,
+            valid: false,
+            stepResults: [],
+            error: agentResult.error ?? "校验失败",
+          };
+        }
+        return {
+          success: true,
+          valid: agentResult.data.valid,
+          stepResults: agentResult.data.stepResults,
+          error: undefined,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { success: false, valid: false, stepResults: [], error: message };
+      }
     }),
 
   modifyStep: protectedMutation

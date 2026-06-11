@@ -53,14 +53,44 @@ describe("executeSQLSteps", () => {
         "sess_1",
         [sampleStep],
         { host: "h", port: 3306, database: "db", username: "u", password: "p" },
-        "oracle",
+        "unknown" as "mysql",
         true,
         metricsBefore
       )
     ).rejects.toThrow(/尚未实现/);
   });
 
-  it("委托 runSqlSteps 并返回结果", async () => {
+  it("Oracle 方言委托 runSqlSteps", async () => {
+    mockedRunSqlSteps.mockResolvedValue({
+      executionId: "exec_oracle",
+      overallStatus: "success",
+      stepResults: [],
+      metricsBefore,
+      startedAt: new Date().toISOString(),
+      completedAt: new Date().toISOString(),
+    });
+
+    const result = await executeSQLSteps(
+      "sess_oracle",
+      [sampleStep],
+      { host: "h", port: 1521, database: "ORCL", username: "u", password: "p" },
+      "oracle",
+      true,
+      metricsBefore
+    );
+
+    expect(result.overallStatus).toBe("success");
+    expect(mockedCreateConnection).toHaveBeenCalledWith(
+      "sess_oracle",
+      expect.any(Object),
+      "oracle"
+    );
+    expect(mockedRunSqlSteps).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "sess_oracle", dryRun: true })
+    );
+  });
+
+  it("MySQL 方言委托 runSqlSteps", async () => {
     mockedRunSqlSteps.mockResolvedValue({
       executionId: "exec_1",
       overallStatus: "success",

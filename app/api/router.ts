@@ -9,6 +9,8 @@ import { uploadRouter } from "./routers/uploadRouter";
 import { chatRouter } from "./routers/chatRouter";
 import { contractRouter } from "./routers/contractRouter";
 import { artifactRouter } from "./routers/artifactRouter";
+import { orchestratorRouter } from "./routers/orchestratorRouter";
+import { runsRouter } from "./routers/runsRouter";
 
 export const appRouter = createRouter({
   ping: publicQuery.query(() => ({ ok: true, ts: Date.now() })),
@@ -22,6 +24,8 @@ export const appRouter = createRouter({
   chat: chatRouter,
   contract: contractRouter,
   artifact: artifactRouter,
+  orchestrator: orchestratorRouter,
+  runs: runsRouter,
 });
 
 export type AppRouter = typeof appRouter;

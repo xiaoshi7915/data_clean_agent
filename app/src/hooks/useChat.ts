@@ -2,7 +2,6 @@ import { useCallback } from "react";
 import type { CleaningPhase, ChatMessage, ChatMessageAction, CleaningRule } from "@contracts/types";
 import type { CleaningSessionState } from "./cleaningSessionState";
 import { isDbSourceType } from "./cleaningSessionState";
-import type { AgentPlanStep } from "./usePipeline";
 
 /** 聊天消息、发送与 Agent 动作 */
 export function useChat(state: CleaningSessionState) {
@@ -307,7 +306,8 @@ export function useChat(state: CleaningSessionState) {
           autoTrigger: result.autoTrigger,
           usedLlm: result.usedLlm,
           ruleUpdatesApplied: result.ruleUpdatesApplied ?? 0,
-          agentPlanSteps: result.agentPlanSteps as AgentPlanStep[] | undefined,
+          orchestratorRunId: result.orchestratorRunId as string | undefined,
+          orchestratorState: result.orchestratorState as string | undefined,
         };
       } catch (err) {
         const fallback = "对话服务暂时不可用，请使用消息下方的快捷按钮继续操作。";

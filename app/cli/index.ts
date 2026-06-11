@@ -16,7 +16,7 @@ import {
 } from "../api/services/dataSourceService";
 import { runSqlSteps } from "../engine/execution/runSqlSteps";
 import { getDataSourcePlugin, listDataSourcePlugins } from "../engine/datasource/plugin";
-import { env } from "../api/lib/env";
+import { isScriptOnlyExecuteBlocked, SCRIPT_ONLY_EXECUTE_MESSAGE } from "./executeGuard";
 import { buildArtifactBundle } from "../api/services/artifactService";
 import "../engine/datasource/mysqlPlugin";
 import "../engine/datasource/postgresPlugin";
@@ -26,15 +26,15 @@ const USAGE = `dca — DataClean Agent CLI
 用法:
   dca explore --type mysql|postgresql --host HOST --port PORT --database DB --user USER --password PASS --table TABLE
   dca compile --contract FILE.yaml [--table TABLE] [--database DB]
-  dca execute --contract FILE.yaml --host HOST --port PORT --database DB --user USER --password PASS [--type mysql|postgresql] [--table TABLE] [--dry-run] [--force-execute]
-  dca export --contract FILE.yaml [--out DIR] [--table TABLE] [--database DB]
-  dca export --session-id SESSION_ID [--out DIR]   # 需 DATABASE_URL 连接元数据库
+  dca execute --contract FILE.yaml ... [--dry-run] [--force-execute]  # ⚠ 已弃用，请使用外部执行器
+  dca export --contract FILE.yaml [--output DIR] [--table TABLE] [--database DB] [--include-dbt] [--include-scheduling]
+  dca export --session-id SESSION_ID [--output DIR]
 
 子命令:
   explore   探查数据源（mysql / postgresql）
   compile   从契约 YAML/JSON 编译清洗 SQL
-  execute   编译契约并执行（默认 --dry-run；真实写库需 --force-execute 且 ALLOW_EXECUTE=true）
-  export    导出脚本包（cleaning.sql + contract.yaml + soda/checks.yml + manifest.json）
+  execute   [已弃用] 请导出脚本包后由 Airflow/dbt/外部 Runner 执行，并通过 webhook 回传校验结果
+  export    导出完整脚本包目录树（cleaning.sql + steps/ + contract.yaml + soda/ + manifest.json + README.md）
 `;
 
 function readDbConfig(args: Record<string, string | boolean>, dialect: ReturnType<typeof resolveDialect>) {
@@ -125,10 +125,8 @@ async function cmdExecute(args: Record<string, string | boolean>): Promise<void>
   // 默认 dry-run；显式 --force-execute 且 ALLOW_EXECUTE=true 才真实写库
   const dryRun = forceExecute ? false : args["dry-run"] !== false;
 
-  if (!dryRun && env.scriptOnly && !env.allowExecute) {
-    console.error(
-      "SCRIPT_ONLY 模式：禁止真实执行。请使用 --dry-run（默认）或设置 ALLOW_EXECUTE=true 后加 --force-execute"
-    );
+  if (isScriptOnlyExecuteBlocked(dryRun)) {
+    console.error(SCRIPT_ONLY_EXECUTE_MESSAGE);
     process.exit(1);
   }
 
@@ -173,13 +171,18 @@ async function cmdExecute(args: Record<string, string | boolean>): Promise<void>
 }
 
 async function cmdExport(args: Record<string, string | boolean>): Promise<void> {
-  const outDir = String(args.out ?? "./cleaning-bundle");
+  const outDir = String(args.output ?? args.out ?? "./cleaning-bundle");
+  const includeDbt = args["include-dbt"] === true;
+  const includeScheduling = args["include-scheduling"] === true;
   const sessionId = args["session-id"] ? String(args["session-id"]) : undefined;
   const contractPath = args.contract ? String(args.contract) : undefined;
 
   if (sessionId) {
     const { exportSessionArtifactBundle } = await import("../api/services/artifactService");
-    const bundle = await exportSessionArtifactBundle(sessionId);
+    const bundle = await exportSessionArtifactBundle(sessionId, {
+      includeDbt,
+      includeScheduling,
+    });
     if (!bundle) {
       console.error("无法从会话导出脚本包（会话不存在或缺少规则/SQL）");
       process.exit(1);
@@ -218,6 +221,7 @@ async function cmdExport(args: Record<string, string | boolean>): Promise<void> 
     dialect,
     tableName,
     databaseName,
+    options: { includeDbt, includeScheduling },
   });
 
   mkdirSync(outDir, { recursive: true });
@@ -246,6 +250,9 @@ async function main(): Promise<void> {
       await cmdCompile(args);
       break;
     case "execute":
+      console.warn(
+        "⚠ dca execute 已弃用：请使用 dca export 导出脚本包，由 Airflow/dbt/外部 Runner 执行，并通过 runs.verificationResult webhook 回传结果。"
+      );
       await cmdExecute(args);
       break;
     case "export":

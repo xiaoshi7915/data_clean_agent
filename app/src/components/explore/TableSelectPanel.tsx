@@ -13,6 +13,7 @@ function formatTableComment(comment: string): string {
 
 interface TableSelectPanelProps {
   dataSource: DataSourceConfig;
+  sessionId?: string;
   selectedTable: string;
   onSelectTable: (table: string) => void;
   onExplore: (table: string) => void;
@@ -27,6 +28,7 @@ const footerButtonClassName =
 
 export function TableSelectPanel({
   dataSource,
+  sessionId,
   selectedTable,
   onSelectTable,
   onExplore,
@@ -47,7 +49,11 @@ export function TableSelectPanel({
     setLoadError(null);
 
     listTables
-      .mutateAsync({ config: dataSource.dbConfig, dbType: dataSource.type as "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle" })
+      .mutateAsync({
+        sessionId,
+        config: dataSource.dbConfig,
+        dbType: dataSource.type as "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle",
+      })
       .then((result) => {
         if (cancelled) return;
         if (result.success) {
@@ -65,7 +71,7 @@ export function TableSelectPanel({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataSource.dbConfig?.host, dataSource.dbConfig?.database]);
+  }, [sessionId, dataSource.dbConfig?.host, dataSource.dbConfig?.database]);
 
   const filteredTables = useMemo(() => {
     const keyword = search.trim().toLowerCase();

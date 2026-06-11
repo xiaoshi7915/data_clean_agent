@@ -40,6 +40,7 @@ export function DataSourceEditDialog({
 
   const utils = trpc.useUtils();
   const testConnection = trpc.explore.testConnection.useMutation();
+  const testConnectionById = trpc.explore.testConnectionByDataSourceId.useMutation();
   const updateDataSource = trpc.session.updateDataSource.useMutation();
 
   useEffect(() => {
@@ -56,7 +57,7 @@ export function DataSourceEditDialog({
         setPort(String(config.dbConfig.port || 3306));
         setDatabase(config.dbConfig.database);
         setUsername(config.dbConfig.username);
-        setPassword(config.dbConfig.password);
+        setPassword("");
         setConnectionStatus("idle");
         setConnectionError("");
       } catch {
@@ -85,12 +86,27 @@ export function DataSourceEditDialog({
   };
 
   const handleTestConnection = async () => {
-    const config = buildConfig();
-    if (!config?.dbConfig) return;
+    if (!dataSourceId) return;
 
     setConnectionStatus("testing");
     setConnectionError("");
     try {
+      if (!password.trim()) {
+        const result = await testConnectionById.mutateAsync({ dataSourceId });
+        if (result.success) {
+          setConnectionStatus("success");
+          toast.success("连接成功");
+        } else {
+          setConnectionStatus("error");
+          setConnectionError(result.error || "连接失败");
+          toast.error(result.error || "连接失败");
+        }
+        return;
+      }
+
+      const config = buildConfig();
+      if (!config?.dbConfig) return;
+
       const result = await testConnection.mutateAsync({
         config: config.dbConfig,
         dbType: config.type as "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle",
@@ -180,6 +196,7 @@ export function DataSourceEditDialog({
                 type="password"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
+                placeholder="留空则保持不变"
               />
             </div>
           </div>

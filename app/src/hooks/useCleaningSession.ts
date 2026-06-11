@@ -42,6 +42,8 @@ export function useCleaningSession() {
     saveDataSourceOnly: sessionList.saveDataSourceOnly,
     resetSessionState: sessionList.resetSessionState,
     refreshLists: sessionList.refreshLists,
+    restartFromTableSelection: sessionList.restartFromTableSelection,
+    syncPhase: state.syncPhase,
 
     startExploration: pipeline.startExploration,
     startAnalysis: pipeline.startAnalysis,
@@ -71,5 +73,10 @@ export function useCleaningSession() {
     setError: state.setError,
     setMessages: state.setMessages,
     setGeneratedSQL: state.setGeneratedSQL,
+    setExplorationResult: state.setExplorationResult,
+    setQualityReport: state.setQualityReport,
+    setCleaningRules: state.setCleaningRules,
+    setExecutionResult: state.setExecutionResult,
+    setRetryContext: state.setRetryContext,
   };
 }

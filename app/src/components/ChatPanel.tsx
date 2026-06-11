@@ -4,6 +4,10 @@ import { Input } from "@/components/ui/input";
 import { Send, Bot, User, Zap } from "lucide-react";
 import type { ChatMessage, ChatMessageAction } from "@contracts/types";
 import { chatActionButtonClassName } from "@/lib/chatActionButton";
+import {
+  applyChatActionDisabledState,
+  type ChatActionSessionContext,
+} from "@/lib/chatActionState";
 import ReactMarkdown from "react-markdown";
 
 interface ChatPanelProps {
@@ -11,9 +15,11 @@ interface ChatPanelProps {
   onSendMessage: (content: string) => void;
   onMessageAction: (action: ChatMessageAction) => void;
   isLoading: boolean;
+  /** 会话进度上下文，用于置灰已完成步骤的快捷按钮 */
+  actionContext: ChatActionSessionContext;
 }
 
-export function ChatPanel({ messages, onSendMessage, onMessageAction, isLoading }: ChatPanelProps) {
+export function ChatPanel({ messages, onSendMessage, onMessageAction, isLoading, actionContext }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -93,13 +99,15 @@ export function ChatPanel({ messages, onSendMessage, onMessageAction, isLoading 
                 </div>
                 {msg.role === "agent" && msg.actions && msg.actions.length > 0 && (
                   <div className="flex flex-wrap gap-1.5">
-                    {msg.actions.map((action) => (
+                    {applyChatActionDisabledState(msg.actions, actionContext)?.map((action) => (
                       <Button
                         key={action.id}
                         variant="outline"
                         size="sm"
-                        className={chatActionButtonClassName}
-                        onClick={() => onMessageAction(action)}
+                        className={`${chatActionButtonClassName} ${
+                          action.disabled ? "opacity-50 cursor-not-allowed" : ""
+                        }`}
+                        onClick={() => !action.disabled && onMessageAction(action)}
                         disabled={isLoading || action.disabled}
                       >
                         {action.label}

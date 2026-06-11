@@ -1,0 +1,7 @@
+version: 2
+
+models:
+  - name: stg_{{table}}_cleaned
+    description: "DataClean Agent 清洗后的 staging 模型"
+    columns:
+{{column_tests}}

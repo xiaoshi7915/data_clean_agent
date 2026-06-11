@@ -3,6 +3,7 @@ import {
   advanceOrchestrator,
   canTransition,
   createOrchestratorContext,
+  runScriptOnlyPipeline,
   SCRIPT_ONLY_PIPELINE,
 } from "./orchestrator";
 
@@ -33,5 +34,14 @@ describe("orchestrator", () => {
   it("SCRIPT_ONLY_PIPELINE 顺序完整", () => {
     expect(SCRIPT_ONLY_PIPELINE[0]).toBe("schema_explore");
     expect(SCRIPT_ONLY_PIPELINE.at(-1)).toBe("done");
+  });
+
+  it("runScriptOnlyPipeline 从当前状态推进到 done", async () => {
+    let ctx = createOrchestratorContext("sess_1", "users");
+    ctx = advanceOrchestrator(ctx, "quality_analyze");
+    ctx = advanceOrchestrator(ctx, "human_confirm");
+    const final = await runScriptOnlyPipeline(ctx);
+    expect(final.state).toBe("done");
+    expect(final.errors).toHaveLength(0);
   });
 });

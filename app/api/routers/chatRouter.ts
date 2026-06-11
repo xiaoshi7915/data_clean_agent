@@ -11,12 +11,26 @@ import {
   type ChatActionIntent,
   type SessionChatContext,
 } from "../services/llmService";
+
+const ORCHESTRATOR_ACTIONS: ChatActionIntent[] = [
+  "startExplore",
+  "startAnalysis",
+  "confirmAll",
+  "generateSQL",
+  "runFullPipeline",
+  "exportScripts",
+  "viewRules",
+];
 import {
   applyRuleUpdatesFromNL,
   expandBulkRuleUpdatesFromMessage,
   isBulkAllFieldsIntent,
 } from "../services/ruleIntentService";
-import { detectMultiIntent, runAgentPlan } from "../services/agentService";
+import { detectMultiIntent } from "../services/agentService";
+import {
+  handleUserMessage as handleOrchestratorMessage,
+  handleMultiStepPlan,
+} from "../agents/orchestrator";
 import type { CleaningRule, RuleStatus } from "@contracts/types";
 
 function mapActionToClient(action?: ChatActionIntent) {
@@ -102,35 +116,83 @@ export const chatRouter = createRouter({
           "收到，正在根据您的描述处理清洗规则。"
         );
 
-        const multiIntent = detectMultiIntent(input.userMessage, ctx);
-        let agentPlanSteps: Awaited<ReturnType<typeof runAgentPlan>>["steps"] | undefined;
+        const multiIntent = input.sessionId ? detectMultiIntent(input.userMessage, ctx) : false;
+        let orchestratorRunId: string | undefined;
+        let orchestratorState: string | undefined;
 
+        // 多步 NL：统一走 orchestrator（orchestration_runs 为唯一状态源）
         if (input.sessionId && multiIntent) {
-          const agentResult = await runAgentPlan(
+          const db = getDb();
+          const ruleRows = await db
+            .select()
+            .from(cleaningRules)
+            .where(eq(cleaningRules.sessionId, input.sessionId))
+            .orderBy(cleaningRules.ruleIndex);
+          const existingRules = loadRulesFromRows(ruleRows);
+
+          if (result.ruleUpdates?.length) {
+            const applyResult = await applyRuleUpdatesFromNL(
+              input.sessionId,
+              result.ruleUpdates,
+              existingRules,
+              { sourceMessage: input.userMessage }
+            );
+            ruleUpdatesApplied = applyResult.applied;
+            if (applyResult.summaries.length > 0) {
+              message = `${message}\n\n✅ 已应用 ${applyResult.applied} 条规则修改`;
+            }
+          }
+
+          const planResult = await handleMultiStepPlan(
             input.sessionId,
             input.userMessage,
             ctx,
             result.ruleUpdates
           );
-          agentPlanSteps = agentResult.steps;
-          ruleUpdatesApplied = agentResult.ruleUpdatesApplied;
-
-          if (agentResult.executedSteps.includes("updateRule") && agentResult.ruleUpdatesApplied > 0) {
-            const summaryText =
-              agentResult.message.includes("已应用") ? agentResult.message : `${agentResult.message}`;
-            message = `${message}\n\n✅ ${summaryText}`;
-          } else {
-            message = `${message}\n\n📋 ${agentResult.message}`;
-          }
-
-          if (agentResult.suggestAction) {
-            result = {
-              ...result,
-              action: agentResult.suggestAction,
-              autoTrigger: true,
-            };
+          if (planResult.orchestrated) {
+            message = planResult.message || message;
+            orchestratorRunId = planResult.runId;
+            orchestratorState = planResult.state;
+            if (planResult.actions.length > 0) {
+              const first = planResult.actions[0];
+              const mappedAction = ORCHESTRATOR_ACTIONS.includes(first.type as ChatActionIntent)
+                ? (first.type as ChatActionIntent)
+                : undefined;
+              if (mappedAction) {
+                result = {
+                  ...result,
+                  action: mappedAction,
+                  autoTrigger: first.autoTrigger ?? result.autoTrigger,
+                };
+              }
+            }
           }
         } else if (input.sessionId) {
+          // 单步/关键词编排意图
+          const orchResult = await handleOrchestratorMessage(
+            input.sessionId,
+            input.userMessage,
+            ctx
+          );
+          if (orchResult.orchestrated && orchResult.message) {
+            message = orchResult.message;
+            orchestratorRunId = orchResult.runId;
+            orchestratorState = orchResult.state;
+            if (orchResult.actions.length > 0 && !result.action) {
+              const first = orchResult.actions[0];
+              const mappedAction = ORCHESTRATOR_ACTIONS.includes(first.type as ChatActionIntent)
+                ? (first.type as ChatActionIntent)
+                : undefined;
+              if (mappedAction) {
+                result = {
+                  ...result,
+                  action: mappedAction,
+                  autoTrigger: first.autoTrigger ?? result.autoTrigger,
+                };
+              }
+            }
+          }
+
           const db = getDb();
           const ruleRows = await db
             .select()
@@ -187,7 +249,8 @@ export const chatRouter = createRouter({
           autoTrigger: result.autoTrigger ?? false,
           usedLlm: result.usedLlm,
           ruleUpdatesApplied,
-          agentPlanSteps,
+          orchestratorRunId,
+          orchestratorState,
         };
       } catch (error) {
         const errMessage = error instanceof Error ? error.message : String(error);

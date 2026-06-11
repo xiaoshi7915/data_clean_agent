@@ -27,4 +27,17 @@ describe("PhaseIndicator", () => {
     fireEvent.click(screen.getByText("分析"));
     expect(onClick).toHaveBeenCalledWith("analyze");
   });
+
+  it("重试按钮可点击并触发 onRetryClick", () => {
+    const onRetry = vi.fn();
+    render(
+      <PhaseIndicator
+        currentPhase="generate"
+        completedPhases={["explore", "analyze", "confirm"]}
+        onRetryClick={onRetry}
+      />
+    );
+    fireEvent.click(screen.getByTitle("重新开始选表流程"));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
 });

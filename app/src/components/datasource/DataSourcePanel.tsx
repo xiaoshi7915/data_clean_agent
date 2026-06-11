@@ -56,30 +56,33 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
 
   const testConnection = trpc.explore.testConnection.useMutation();
 
+  const isSqlite = dbType === "sqlite";
+  const dbFormReady = isSqlite ? Boolean(database.trim()) : Boolean(host && database && username);
+
   const handleDBConnect = () => {
-    if (!host || !database || !username) return;
+    if (!dbFormReady) return;
     if (!isDbExploreSupported(dbType)) {
-      toast.error("该数据库类型尚未支持，当前仅 MySQL 可探查与执行");
+      toast.error("该数据库类型尚未支持探查");
       return;
     }
     const config: DataSourceConfig = {
       type: dbType as DataSourceConfig["type"],
       name: displayName.trim() || database,
       dbConfig: {
-        host,
-        port: parseInt(port) || 3306,
+        host: isSqlite ? "local" : host,
+        port: parseInt(port) || (isSqlite ? 0 : 3306),
         database,
-        username,
-        password,
+        username: isSqlite ? "" : username,
+        password: isSqlite ? "" : password,
       },
     };
     onConnect(config);
   };
 
   const handleTestConnection = async () => {
-    if (!host || !database || !username) return;
+    if (!dbFormReady) return;
     if (!isDbExploreSupported(dbType)) {
-      toast.error("该数据库类型尚未支持，当前仅 MySQL 可测试连接");
+      toast.error("该数据库类型尚未支持连接测试");
       return;
     }
 
@@ -88,11 +91,11 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
     try {
       const result = await testConnection.mutateAsync({
         config: {
-          host,
-          port: parseInt(port) || 3306,
+          host: isSqlite ? "local" : host,
+          port: parseInt(port) || (isSqlite ? 0 : 3306),
           database,
-          username,
-          password,
+          username: isSqlite ? "" : username,
+          password: isSqlite ? "" : password,
         },
         dbType: dbType as "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle",
       });
@@ -203,34 +206,28 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
                 数据库连接配置
               </CardTitle>
               <CardDescription>
-                当前已实现 MySQL / PostgreSQL 探查与 SQL 执行；SQLite、SQL Server、Oracle 显示为「即将支持」
+                支持 MySQL、PostgreSQL、SQLite、SQL Server、Oracle 探查与 SQL 清洗（执行需 ALLOW_EXECUTE）
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               <div className="grid grid-cols-5 gap-2">
-                {dbTypes.map((db) => {
-                  const supported = isDbExploreSupported(db.value);
-                  return (
+                {dbTypes.map((db) => (
                   <button
                     key={db.value}
                     onClick={() => {
                       setDbType(db.value);
                       setPort(getPortForDB(db.value));
                     }}
-                    className={`relative flex flex-col items-center gap-1.5 p-3 rounded-xl border transition-all ${
+                    className={`flex flex-col items-center gap-1.5 p-3 rounded-xl border transition-all ${
                       dbType === db.value
                         ? "border-primary bg-primary/5 text-primary"
                         : "border-border hover:border-primary/30 hover:bg-accent"
-                    } ${!supported ? "opacity-70" : ""}`}
+                    }`}
                   >
                     {db.icon}
                     <span className="text-xs font-medium">{db.label}</span>
-                    {!supported && (
-                      <span className="text-[10px] text-amber-600 dark:text-amber-400">即将支持</span>
-                    )}
                   </button>
-                  );
-                })}
+                ))}
               </div>
 
               <Separator />
@@ -246,58 +243,65 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
                 <p className="text-xs text-muted-foreground">留空时将使用数据库名作为显示名称</p>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="host">主机地址</Label>
-                  <Input
-                    id="host"
-                    placeholder="localhost"
-                    value={host}
-                    onChange={(e) => setHost(e.target.value)}
-                  />
+              {!isSqlite && (
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="host">主机地址</Label>
+                    <Input
+                      id="host"
+                      placeholder="localhost"
+                      value={host}
+                      onChange={(e) => setHost(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="port">端口</Label>
+                    <Input
+                      id="port"
+                      placeholder="3306"
+                      value={port}
+                      onChange={(e) => setPort(e.target.value)}
+                    />
+                  </div>
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="port">端口</Label>
-                  <Input
-                    id="port"
-                    placeholder="3306"
-                    value={port}
-                    onChange={(e) => setPort(e.target.value)}
-                  />
-                </div>
-              </div>
+              )}
 
               <div className="space-y-2">
-                <Label htmlFor="database">数据库名</Label>
+                <Label htmlFor="database">{isSqlite ? "数据库文件路径" : "数据库名"}</Label>
                 <Input
                   id="database"
-                  placeholder="my_database"
+                  placeholder={isSqlite ? "/path/to/data.db" : "my_database"}
                   value={database}
                   onChange={(e) => handleDatabaseChange(e.target.value)}
                 />
+                {isSqlite && (
+                  <p className="text-xs text-muted-foreground">填写服务器上可访问的 .db 文件绝对路径</p>
+                )}
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="username">用户名</Label>
-                  <Input
-                    id="username"
-                    placeholder="root"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                  />
+              {!isSqlite && (
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="username">用户名</Label>
+                    <Input
+                      id="username"
+                      placeholder="root"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="password">密码</Label>
+                    <Input
+                      id="password"
+                      type="password"
+                      placeholder="••••••"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                    />
+                  </div>
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="password">密码</Label>
-                  <Input
-                    id="password"
-                    type="password"
-                    placeholder="••••••"
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                  />
-                </div>
-              </div>
+              )}
 
               <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-500/5 border border-amber-500/10">
                 <Shield className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
@@ -326,9 +330,7 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
                   onClick={handleTestConnection}
                   disabled={
                     connectionStatus === "testing" ||
-                    !host ||
-                    !database ||
-                    !username ||
+                    !dbFormReady ||
                     !isDbExploreSupported(dbType)
                   }
                   className="flex-1"
@@ -346,9 +348,7 @@ export function DataSourcePanel({ onConnect, onFileUpload, isLoading, compact }:
                   onClick={handleDBConnect}
                   disabled={
                     isLoading ||
-                    !host ||
-                    !database ||
-                    !username ||
+                    !dbFormReady ||
                     !isDbExploreSupported(dbType)
                   }
                   className="flex-1"

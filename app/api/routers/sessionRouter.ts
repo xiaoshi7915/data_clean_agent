@@ -18,6 +18,7 @@ import {
   updateDataSource,
   upsertDataSource,
 } from "../services/dataSourceStoreService";
+import { sanitizeDataSourceForClient } from "../lib/dataSourceSanitizer";
 
 const dataSourceSchema = z.object({
   type: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle", "csv", "json", "xml", "xlsx"]),
@@ -195,7 +196,7 @@ export const sessionRouter = createRouter({
     .input(z.object({ dataSourceId: z.string() }))
     .query(async ({ input }) => {
       const config = await getDataSourceById(input.dataSourceId);
-      return { found: !!config, config };
+      return { found: !!config, config: sanitizeDataSourceForClient(config ?? undefined) };
     }),
 
   updateDataSource: protectedMutation

@@ -1,9 +1,15 @@
 import mysql from "mysql2/promise";
 import pg from "pg";
+import { DatabaseSync } from "node:sqlite";
+import sql from "mssql";
+import oracledb from "oracledb";
 import type { DatabaseDialect } from "@contracts/types";
 import {
   createMysqlExecutor,
   createPostgresExecutor,
+  createSqliteExecutor,
+  createSqlServerExecutor,
+  createOracleExecutor,
   type SqlExecutor,
 } from "../../engine/execution/sqlExecutor";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -26,14 +32,21 @@ import { metricRegistry } from "../../engine/metrics/metricRegistry";
 import { ExplorationMetricCollector } from "../../engine/metrics/metricSqlBuilder";
 import { mysqlDialect } from "../../engine/sql/mysqlDialect";
 import { getDataSourcePlugin } from "../../engine/datasource/plugin";
+import { unsupportedDbMessage } from "@contracts/dataSourceSupport";
 import "../../engine/datasource/mysqlPlugin";
 import "../../engine/datasource/postgresPlugin";
+import "../../engine/datasource/sqlitePlugin";
+import "../../engine/datasource/sqlserverPlugin";
+import "../../engine/datasource/oraclePlugin";
 
 // ---- Database Connection Pool (per-session) ----
 
 type SessionDbPool =
   | { dialect: "mysql"; pool: mysql.Pool }
-  | { dialect: "postgresql"; pool: pg.Pool };
+  | { dialect: "postgresql"; pool: pg.Pool }
+  | { dialect: "sqlite"; db: DatabaseSync }
+  | { dialect: "sqlserver"; pool: sql.ConnectionPool }
+  | { dialect: "oracle"; pool: oracledb.Pool };
 
 const connectionPools = new Map<string, SessionDbPool>();
 
@@ -58,6 +71,49 @@ export async function createConnectionForDialect(
     const client = await pool.connect();
     client.release();
     const entry: SessionDbPool = { dialect: "postgresql", pool };
+    connectionPools.set(sessionId, entry);
+    return entry;
+  }
+
+  if (dialect === "sqlite") {
+    const filePath = config.database?.trim();
+    if (!filePath) {
+      throw new Error("SQLite 需要在 database 字段指定 .db 文件路径");
+    }
+    const db = new DatabaseSync(filePath);
+    db.prepare("SELECT 1").get();
+    const entry: SessionDbPool = { dialect: "sqlite", db };
+    connectionPools.set(sessionId, entry);
+    return entry;
+  }
+
+  if (dialect === "sqlserver") {
+    const pool = await new sql.ConnectionPool({
+      server: config.host,
+      port: config.port,
+      database: config.database,
+      user: config.username,
+      password: config.password,
+      options: { encrypt: true, trustServerCertificate: true },
+      connectionTimeout: 10000,
+      pool: { max: 5, min: 0 },
+    }).connect();
+    const entry: SessionDbPool = { dialect: "sqlserver", pool };
+    connectionPools.set(sessionId, entry);
+    return entry;
+  }
+
+  if (dialect === "oracle") {
+    const pool = await oracledb.createPool({
+      user: config.username,
+      password: config.password,
+      connectString: `${config.host}:${config.port}/${config.database}`,
+      poolMin: 1,
+      poolMax: 5,
+    });
+    const connection = await pool.getConnection();
+    await connection.close();
+    const entry: SessionDbPool = { dialect: "oracle", pool };
     connectionPools.set(sessionId, entry);
     return entry;
   }
@@ -93,18 +149,48 @@ export async function createConnection(sessionId: string, config: DBConnectionCo
 
 /** 将会话连接池包装为 SqlExecutor */
 export function createSqlExecutorFromPool(entry: SessionDbPool): SqlExecutor {
-  if (entry.dialect === "postgresql") {
-    return createPostgresExecutor(entry.pool);
+  switch (entry.dialect) {
+    case "postgresql":
+      return createPostgresExecutor(entry.pool);
+    case "sqlite":
+      return createSqliteExecutor(entry.db);
+    case "sqlserver":
+      return createSqlServerExecutor(entry.pool);
+    case "oracle":
+      return createOracleExecutor(entry.pool);
+    case "mysql":
+      return createMysqlExecutor(entry.pool);
+    default: {
+      const _exhaustive: never = entry;
+      throw new Error(`不支持的方言: ${String(_exhaustive)}`);
+    }
   }
-  return createMysqlExecutor(entry.pool);
 }
 
 export async function closeConnection(sessionId: string): Promise<void> {
   const entry = connectionPools.get(sessionId);
-  if (entry) {
-    await entry.pool.end();
-    connectionPools.delete(sessionId);
+  if (!entry) return;
+
+  switch (entry.dialect) {
+    case "sqlite":
+      entry.db.close();
+      break;
+    case "sqlserver":
+      await entry.pool.close();
+      break;
+    case "oracle":
+      await entry.pool.close(0);
+      break;
+    case "mysql":
+    case "postgresql":
+      await entry.pool.end();
+      break;
+    default: {
+      const _exhaustive: never = entry;
+      throw new Error(`无法关闭未知连接: ${String(_exhaustive)}`);
+    }
   }
+  connectionPools.delete(sessionId);
 }
 
 export function getConnection(sessionId: string): mysql.Pool | undefined {
@@ -189,7 +275,7 @@ export async function listDatabaseTables(
     return plugin.listTables(config);
   }
 
-  return listMysqlTables(config);
+  throw new Error(unsupportedDbMessage(String(dbType)));
 }
 
 export async function exploreDatabase(
@@ -422,7 +508,40 @@ export async function testDatabaseConnection(
     return;
   }
 
-  await testMysqlConnection(config);
+  throw new Error(unsupportedDbMessage(String(dbType)));
+}
+
+/** 检测完全重复行（与 DB 探查语义对齐：统计重复组数） */
+export function detectFullyDuplicateRowsIssue(
+  rows: Record<string, unknown>[],
+  columns: string[],
+  totalRows: number
+): DetectedIssue | null {
+  if (totalRows === 0 || columns.length === 0) return null;
+
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const key = columns.map((col) => JSON.stringify(row[col] ?? null)).join("\0");
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+
+  let dupGroupCount = 0;
+  for (const count of counts.values()) {
+    if (count > 1) dupGroupCount++;
+  }
+
+  if (dupGroupCount === 0) return null;
+
+  return {
+    id: "issue_full_dup",
+    column: "*",
+    issueType: "完全重复行",
+    severity: "high",
+    affectedRows: dupGroupCount,
+    affectedPercent: parseFloat(((dupGroupCount / totalRows) * 100).toFixed(2)),
+    description: `发现 ${dupGroupCount} 组完全重复的行`,
+    suggestion: "建议删除完全重复的行，保留一条",
+  };
 }
 
 export async function parseCSVFile(filePath: string, previewRows: number = 100): Promise<ExplorationResult> {
@@ -480,6 +599,13 @@ export async function parseCSVFile(filePath: string, previewRows: number = 100):
       });
     }
   }
+
+  const dupIssue = detectFullyDuplicateRowsIssue(
+    allResult.data as Record<string, unknown>[],
+    columns,
+    totalRows
+  );
+  if (dupIssue) issues.push(dupIssue);
 
   return {
     sourceType: "csv",
@@ -548,6 +674,9 @@ export async function parseJSONFile(filePath: string, previewRows: number = 100)
       suggestion: "建议使用合适的值填充空值",
     }));
 
+  const dupIssue = detectFullyDuplicateRowsIssue(rows, columns, totalRows);
+  if (dupIssue) issues.push(dupIssue);
+
   return {
     sourceType: "json",
     sourceName: path.basename(filePath),
@@ -615,13 +744,17 @@ export async function parseXLSXFile(filePath: string, previewRows: number = 100)
   }
 
   // Convert to record format for sample data
-  const sampleData = dataRows.slice(0, 10).map((row) => {
+  const allRecords = dataRows.map((row) => {
     const record: Record<string, unknown> = {};
     headers.forEach((h, i) => {
       record[h] = row[i];
     });
     return record;
   });
+  const sampleData = allRecords.slice(0, 10);
+
+  const dupIssue = detectFullyDuplicateRowsIssue(allRecords, headers, totalRows);
+  if (dupIssue) issues.push(dupIssue);
 
   return {
     sourceType: "xlsx",
@@ -704,6 +837,9 @@ export async function parseXMLFile(filePath: string, previewRows: number = 100):
       description: `列 "${cs.columnName}" 空值率为 ${cs.nullRate}%`,
       suggestion: "建议使用合适的值填充空值",
     }));
+
+  const dupIssue = detectFullyDuplicateRowsIssue(rows, columns, totalRows);
+  if (dupIssue) issues.push(dupIssue);
 
   return {
     sourceType: "xml",
