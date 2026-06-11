@@ -1,0 +1,17 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: data-clean-agent
+    ports:
+      - "29000:29000"
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "29000"
+      UPLOAD_DIR: /app/uploads
+    volumes:
+      - ./uploads:/app/uploads
+    restart: unless-stopped
