@@ -1,6 +1,7 @@
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, isNull } from "drizzle-orm";
 import { encryptCredentialForStorage, decryptCredential } from "../lib/credentialCrypto";
 import { isPasswordMissing } from "../lib/dataSourceSanitizer";
+import { normalizeStoredUploadPath, toStoredUploadPath } from "./uploadPathService";
 import { getDb } from "../queries/connection";
 import { savedDataSources, cleaningSessions } from "@db/schema";
 import type { DataSourceConfig } from "@contracts/types";
@@ -35,11 +36,15 @@ function rowToConfig(row: typeof savedDataSources.$inferSelect): DataSourceConfi
       fileName: row.fileName,
       fileSize: 0,
       fileType: (row.fileType as "csv" | "json" | "xml" | "xlsx") || "csv",
-      filePath: row.filePath || "",
+      // 读取时规范化路径，兼容历史绝对路径
+      filePath: row.filePath ? normalizeStoredUploadPath(row.filePath) : "",
     };
   }
   return config;
 }
+
+/** 仅匹配未逻辑删除的数据源 */
+const notDeleted = isNull(savedDataSources.deletedAt);
 
 export async function findExistingDataSource(config: DataSourceConfig): Promise<string | null> {
   const db = getDb();
@@ -50,6 +55,7 @@ export async function findExistingDataSource(config: DataSourceConfig): Promise<
       .from(savedDataSources)
       .where(
         and(
+          notDeleted,
           eq(savedDataSources.type, config.type),
           eq(savedDataSources.dbHost, config.dbConfig.host),
           eq(savedDataSources.dbPort, config.dbConfig.port),
@@ -67,12 +73,27 @@ export async function findExistingDataSource(config: DataSourceConfig): Promise<
       .from(savedDataSources)
       .where(
         and(
+          notDeleted,
+          eq(savedDataSources.type, config.type),
+          eq(savedDataSources.fileName, config.fileConfig.fileName)
+        )
+      )
+      .limit(1);
+    // 优先按文件名匹配；路径仅存 basename，跨环境可复用
+    if (rows[0]?.dataSourceId) return rows[0].dataSourceId;
+
+    const legacyRows = await db
+      .select({ dataSourceId: savedDataSources.dataSourceId })
+      .from(savedDataSources)
+      .where(
+        and(
+          notDeleted,
           eq(savedDataSources.type, config.type),
           eq(savedDataSources.filePath, config.fileConfig.filePath)
         )
       )
       .limit(1);
-    return rows[0]?.dataSourceId ?? null;
+    return legacyRows[0]?.dataSourceId ?? null;
   }
 
   return null;
@@ -91,6 +112,7 @@ export async function findDataSourceByConnection(
     .from(savedDataSources)
     .where(
       and(
+        notDeleted,
         eq(savedDataSources.type, type as DataSourceConfig["type"]),
         eq(savedDataSources.dbHost, host),
         eq(savedDataSources.dbPort, port),
@@ -132,7 +154,9 @@ export async function upsertDataSource(config: DataSourceConfig): Promise<string
     dbPassword: encryptCredentialForStorage(config.dbConfig?.password),
     fileName: config.fileConfig?.fileName ?? null,
     fileType: config.fileConfig?.fileType ?? null,
-    filePath: config.fileConfig?.filePath ?? null,
+    filePath: config.fileConfig?.filePath
+      ? toStoredUploadPath(config.fileConfig.filePath)
+      : null,
   });
 
   return dataSourceId;
@@ -143,7 +167,7 @@ export async function getDataSourceById(dataSourceId: string): Promise<DataSourc
   const rows = await db
     .select()
     .from(savedDataSources)
-    .where(eq(savedDataSources.dataSourceId, dataSourceId))
+    .where(and(eq(savedDataSources.dataSourceId, dataSourceId), notDeleted))
     .limit(1);
 
   if (rows.length === 0) return null;
@@ -158,7 +182,7 @@ export async function updateDataSource(
   const rows = await db
     .select({ id: savedDataSources.id })
     .from(savedDataSources)
-    .where(eq(savedDataSources.dataSourceId, dataSourceId))
+    .where(and(eq(savedDataSources.dataSourceId, dataSourceId), notDeleted))
     .limit(1);
 
   if (rows.length === 0) return false;
@@ -183,7 +207,9 @@ export async function updateDataSource(
       dbPassword: encryptCredentialForStorage(passwordToStore),
       fileName: config.fileConfig?.fileName ?? null,
       fileType: config.fileConfig?.fileType ?? null,
-      filePath: config.fileConfig?.filePath ?? null,
+      filePath: config.fileConfig?.filePath
+        ? toStoredUploadPath(config.fileConfig.filePath)
+        : null,
       updatedAt: new Date(),
     })
     .where(eq(savedDataSources.dataSourceId, dataSourceId));
@@ -191,9 +217,32 @@ export async function updateDataSource(
   return true;
 }
 
+/** 逻辑删除数据源（不级联删除会话） */
+export async function softDeleteDataSource(dataSourceId: string): Promise<boolean> {
+  const db = getDb();
+  const rows = await db
+    .select({ id: savedDataSources.id })
+    .from(savedDataSources)
+    .where(and(eq(savedDataSources.dataSourceId, dataSourceId), notDeleted))
+    .limit(1);
+
+  if (rows.length === 0) return false;
+
+  await db
+    .update(savedDataSources)
+    .set({ deletedAt: new Date(), updatedAt: new Date() })
+    .where(eq(savedDataSources.dataSourceId, dataSourceId));
+
+  return true;
+}
+
 export async function listSavedDataSources(): Promise<SavedDataSourceSummary[]> {
   const db = getDb();
-  const rows = await db.select().from(savedDataSources).orderBy(desc(savedDataSources.updatedAt));
+  const rows = await db
+    .select()
+    .from(savedDataSources)
+    .where(notDeleted)
+    .orderBy(desc(savedDataSources.updatedAt));
   const sessions = await db
     .select({
       dataSourceId: cleaningSessions.dataSourceId,

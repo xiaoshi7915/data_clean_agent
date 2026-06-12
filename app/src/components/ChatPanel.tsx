@@ -8,18 +8,28 @@ import {
   applyChatActionDisabledState,
   type ChatActionSessionContext,
 } from "@/lib/chatActionState";
+import { resolveActionRunIndex, resolveActionRevisionIndex } from "@/lib/chatActionRun";
 import ReactMarkdown from "react-markdown";
 
 interface ChatPanelProps {
   messages: ChatMessage[];
   onSendMessage: (content: string) => void;
-  onMessageAction: (action: ChatMessageAction) => void;
+  onMessageAction: (action: ChatMessageAction, message?: ChatMessage) => void;
   isLoading: boolean;
   /** 会话进度上下文，用于置灰已完成步骤的快捷按钮 */
   actionContext: ChatActionSessionContext;
+  /** 历史 run 只读：禁用输入与发送 */
+  readOnly?: boolean;
 }
 
-export function ChatPanel({ messages, onSendMessage, onMessageAction, isLoading, actionContext }: ChatPanelProps) {
+export function ChatPanel({
+  messages,
+  onSendMessage,
+  onMessageAction,
+  isLoading,
+  actionContext,
+  readOnly = false,
+}: ChatPanelProps) {
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -107,7 +117,19 @@ export function ChatPanel({ messages, onSendMessage, onMessageAction, isLoading,
                         className={`${chatActionButtonClassName} ${
                           action.disabled ? "opacity-50 cursor-not-allowed" : ""
                         }`}
-                        onClick={() => !action.disabled && onMessageAction(action)}
+                        onClick={() => {
+                          if (action.disabled) return;
+                          const runIndex = resolveActionRunIndex(action, msg);
+                          const revisionIndex = resolveActionRevisionIndex(action, msg);
+                          onMessageAction(
+                            {
+                              ...action,
+                              ...(runIndex != null ? { runIndex } : {}),
+                              ...(revisionIndex != null ? { revisionIndex } : {}),
+                            },
+                            msg
+                          );
+                        }}
                         disabled={isLoading || action.disabled}
                       >
                         {action.label}
@@ -139,14 +161,14 @@ export function ChatPanel({ messages, onSendMessage, onMessageAction, isLoading,
       <div className="p-4 border-t shrink-0 bg-card/30">
         <div className="flex gap-2">
           <Input
-            placeholder="输入消息或指令..."
+            placeholder={readOnly ? "历史快照只读，请切换到当前运行后再发送消息" : "输入消息或指令..."}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSend()}
-            disabled={isLoading}
+            disabled={isLoading || readOnly}
             className="text-sm"
           />
-          <Button size="icon" onClick={handleSend} disabled={isLoading || !input.trim()}>
+          <Button size="icon" onClick={handleSend} disabled={isLoading || readOnly || !input.trim()}>
             <Send className="w-4 h-4" />
           </Button>
         </div>

@@ -23,7 +23,11 @@
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:push": "drizzle-kit push",
-    "db:apply:004": "node scripts/run-migration-004.mjs"
+    "db:apply:004": "node scripts/run-migration-004.mjs",
+    "db:apply:005": "node scripts/run-migration-005.mjs",
+    "db:apply:007": "node scripts/run-migration-007.mjs",
+    "db:apply:008": "node scripts/run-migration-008.mjs",
+    "db:apply:009": "node scripts/run-migration-009.mjs"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.3",

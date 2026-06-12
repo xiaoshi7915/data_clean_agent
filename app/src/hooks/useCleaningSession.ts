@@ -1,8 +1,12 @@
+import { useMemo } from "react";
 import { useCleaningSessionState } from "./cleaningSessionState";
 import { useChat } from "./useChat";
 import { useSessionList } from "./useSessionList";
 import { useRuleContract } from "./useRuleContract";
 import { usePipeline } from "./usePipeline";
+
+import { computePipelineRunDiff } from "@/lib/pipelineRunDiff";
+import { isHistoricalRevisionView } from "./writableRunGuard";
 
 /**
  * 清洗会话门面 Hook：组合 sessionList / ruleContract / pipeline / chat 子模块，保持 Home.tsx 公共 API 不变。
@@ -13,6 +17,33 @@ export function useCleaningSession() {
   const sessionList = useSessionList(state, chat);
   const ruleContract = useRuleContract(state, chat);
   const pipeline = usePipeline(state, chat);
+
+  const isViewingHistoricalRun = state.viewingRunIndex !== state.currentRunIndex;
+  const isViewingHistoricalRevision = isHistoricalRevisionView(
+    state.viewingRevisionIndex,
+    state.latestRevisionIndex
+  );
+  const isViewingHistoricalSnapshot = isViewingHistoricalRun || isViewingHistoricalRevision;
+
+  const pipelineRunDiff = useMemo(() => {
+    if (!state.compareRunSnapshot || state.viewingRunIndex <= 1) return null;
+    return computePipelineRunDiff(
+      state.viewingRunIndex,
+      state.viewingRunIndex - 1,
+      {
+        qualityReport: state.qualityReport,
+        cleaningRules: state.cleaningRules,
+        generatedSQL: state.generatedSQL,
+      },
+      state.compareRunSnapshot
+    );
+  }, [
+    state.compareRunSnapshot,
+    state.viewingRunIndex,
+    state.qualityReport,
+    state.cleaningRules,
+    state.generatedSQL,
+  ]);
 
   return {
     sessionId: state.sessionId,
@@ -26,6 +57,7 @@ export function useCleaningSession() {
     cleaningRules: state.cleaningRules,
     generatedSQL: state.generatedSQL,
     executionResult: state.executionResult,
+    executionHistory: state.executionHistory,
     retryContext: state.retryContext,
     messages: state.messages,
     sessionList: state.sessionList,
@@ -34,20 +66,41 @@ export function useCleaningSession() {
     isPipelineRunning: state.isPipelineRunning,
     error: state.error,
     retryCount: state.retryCount,
+    currentRunIndex: state.currentRunIndex,
+    viewingRunIndex: state.viewingRunIndex,
+    pipelineRuns: state.pipelineRuns,
+    isViewingHistoricalRun,
+    isViewingHistoricalRevision,
+    isViewingHistoricalSnapshot,
+    viewingRevisionIndex: state.viewingRevisionIndex,
+    latestRevisionIndex: state.latestRevisionIndex,
+    pipelineRunDiff,
+    compareRunSnapshot: state.compareRunSnapshot,
 
     initSession: sessionList.initSession,
     loadSession: sessionList.loadSession,
     deleteSessionById: sessionList.deleteSessionById,
+    deleteDataSourceById: sessionList.deleteDataSourceById,
     createConversationFromDataSource: sessionList.createConversationFromDataSource,
     saveDataSourceOnly: sessionList.saveDataSourceOnly,
     resetSessionState: sessionList.resetSessionState,
     refreshLists: sessionList.refreshLists,
     restartFromTableSelection: sessionList.restartFromTableSelection,
+    retryInPlace: sessionList.retryInPlace,
+    switchPipelineRun: sessionList.switchPipelineRun,
+    switchPipelineRevision: sessionList.switchPipelineRevision,
+    switchToLiveRevision: sessionList.switchToLiveRevision,
+    retryWithNewSession: sessionList.retryWithNewSession,
+    selectSessionTargetTable: sessionList.selectSessionTargetTable,
+    requestOpenTableSelect: sessionList.requestOpenTableSelect,
     syncPhase: state.syncPhase,
 
     startExploration: pipeline.startExploration,
     startAnalysis: pipeline.startAnalysis,
+    runAutoExploreAndAnalyze: pipeline.runAutoExploreAndAnalyze,
     runFullPipelineToSQL: pipeline.runFullPipelineToSQL,
+    runPipelineToGenerateSQL: pipeline.runPipelineToGenerateSQL,
+    runBatchDatabasePipeline: pipeline.runBatchDatabasePipeline,
     runAgentPlanBySteps: pipeline.runAgentPlanBySteps,
     updateRuleStatus: ruleContract.updateRuleStatus,
     updateRuleParameters: ruleContract.updateRuleParameters,

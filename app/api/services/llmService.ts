@@ -100,9 +100,12 @@ function buildSystemPrompt(ctx: SessionChatContext): string {
 
 规则自然语言修改（ruleUpdates）：
 - 当用户描述字段填充、策略切换、确认/跳过某规则时，action 设为 "updateRule"（或 skipRule/confirmRule）
+- 当用户要求「新增/添加字段」「在 X 字段后添加 Y」「Y 作为 X 的映射列」时，返回 addDerivedColumn（新列名）与 field（源字段），可选 insertAfter
+- 示例：在 level 后添加 level_code 映射 → {"field":"level","addDerivedColumn":"level_code","insertAfter":"level"}
 - ruleUpdates 中 field 必须是用户提到的真实列名，禁止使用「字段名」等占位符
 - 用户说「所有字段」「全部字段」且要统一填充时，为每个相关字段各生成一条 ruleUpdates（field 为真实列名）
-- 理解示例（禁止原样输出到 message）：website→未知；assi_time→NOW()；age→skip
+- 用户说「把 X 都补充为 Y」「填充为 Y」时，返回 variantKey:"fixed"、fillValue:"Y"；「都补充/都填」表示 replaceAll:true
+- 理解示例（禁止原样输出到 message）：website→未知；punishment→服刑中；assi_time→NOW()；age→skip
 - field 尽量与探查 schema 一致
 
 回复要求：
@@ -191,6 +194,12 @@ function parseRuleUpdates(raw: unknown): RuleUpdateIntent[] | undefined {
     }
     if (typeof record.action === "string" && record.action.trim()) {
       intent.action = record.action.trim();
+    }
+    if (typeof record.addDerivedColumn === "string" && record.addDerivedColumn.trim()) {
+      intent.addDerivedColumn = record.addDerivedColumn.trim();
+    }
+    if (typeof record.insertAfter === "string" && record.insertAfter.trim()) {
+      intent.insertAfter = record.insertAfter.trim();
     }
     updates.push(intent);
   }

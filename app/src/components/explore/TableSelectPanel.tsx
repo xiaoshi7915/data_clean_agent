@@ -18,6 +18,8 @@ interface TableSelectPanelProps {
   onSelectTable: (table: string) => void;
   onExplore: (table: string) => void;
   onRunFullPipeline?: (table: string) => void | Promise<void>;
+  /** 探查按钮文案：新会话为「开始探查」，重试选表后为「重新探查」 */
+  exploreButtonLabel?: string;
   isLoading: boolean;
   isPipelineRunning?: boolean;
   embedded?: boolean;
@@ -33,6 +35,7 @@ export function TableSelectPanel({
   onSelectTable,
   onExplore,
   onRunFullPipeline,
+  exploreButtonLabel = "开始探查",
   isLoading,
   isPipelineRunning = false,
   embedded = false,
@@ -94,7 +97,7 @@ export function TableSelectPanel({
           </div>
           <h3 className="text-lg font-semibold">选择要探查的数据表</h3>
           <p className="text-sm text-muted-foreground">
-            数据源：{dataSource.name}
+            数据源：{dataSource.name} · 点击表名选中后，点击下方按钮开始探查或生成 SQL
           </p>
         </div>
       )}
@@ -186,7 +189,7 @@ export function TableSelectPanel({
               探查中...
             </span>
           ) : (
-            "开始探查"
+            exploreButtonLabel
           )}
         </Button>
         {onRunFullPipeline && (

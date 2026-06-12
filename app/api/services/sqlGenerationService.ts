@@ -3,14 +3,67 @@ import type {
   SQLGenerationResult,
   SQLStep,
   DatabaseDialect,
+  SQLGenerationOptions,
 } from "@contracts/types";
 import { mysqlDialect } from "../../engine/sql/mysqlDialect";
 import { postgresDialect } from "../../engine/sql/postgresDialect";
 import { resolveRuleVariant } from "./analysisService";
 import { buildRowCountValidationSql } from "./sqlGenerationMetrics";
+import {
+  buildDictMapCaseSql,
+  buildDictMapRejectWhereSql,
+  resolveFieldDictMap,
+  resolveUnmatchedStrategy,
+} from "../lib/dictMapRules";
+import { buildValidateExpressionSql, buildValidateRejectWhereSql } from "../lib/validateRuleSql";
+import { buildDateIsoSql, resolveSourceFormats } from "../lib/dateFormatRules";
+import { buildFilterKeepWhereSql } from "../lib/filterRules";
+import {
+  buildHalfwidthSql,
+  buildStripCharsSql,
+  buildSubstringSql,
+  buildFullwidthNormalizeSql,
+  type FullwidthCharPair,
+  type StripCharClass,
+} from "../lib/textFormatRules";
+import {
+  buildProblemTableCreateSql,
+  problemTableName,
+} from "../lib/problemRecords";
+import {
+  buildEntityValidateSql,
+  buildNumericValidateSql,
+  buildPartitionDedupPartitionCols,
+} from "../lib/advancedRuleHelpers";
 
 export function cleanedTableName(tableName: string): string {
   return `${tableName}_cleaned`;
+}
+
+/** 合并主清洗 SQL：CREATE TABLE（及衍生列 ALTER）+ INSERT SELECT */
+export function buildConsolidatedCleaningSql(steps: SQLStep[]): string {
+  const createOutputStep = steps.find(
+    (s) => s.operationType === "CREATE" && s.name.includes("清洗输出表")
+  );
+  const alterSteps = steps.filter(
+    (s) => s.operationType === "CREATE" && s.name.includes("衍生列")
+  );
+  const insertStep = steps.find(
+    (s) =>
+      s.operationType === "INSERT" &&
+      !s.name.includes("问题记录") &&
+      !s.name.includes("备份")
+  );
+
+  const parts: string[] = [];
+  if (createOutputStep?.sql) parts.push(createOutputStep.sql.trim());
+  for (const alter of alterSteps) {
+    if (alter.sql?.trim()) parts.push(alter.sql.trim());
+  }
+  if (insertStep?.sql) parts.push(insertStep.sql.trim());
+
+  if (parts.length === 0) return "";
+  return parts.map((p) => (p.endsWith(";") ? p : `${p};`)).join("\n\n");
 }
 
 export function generateCleaningSQL(
@@ -18,7 +71,8 @@ export function generateCleaningSQL(
   dialect: DatabaseDialect,
   tableName: string,
   databaseName: string,
-  columns: string[] = []
+  columns: string[] = [],
+  options: SQLGenerationOptions = {}
 ): SQLGenerationResult {
   const confirmedRules = rules
     .filter((r) => r.status === "confirmed")
@@ -43,7 +97,7 @@ export function generateCleaningSQL(
     (confirmedRules.find((r) => r.action === "dedup")?.parameters.keep as string) ||
     "first";
 
-  const consolidatedSql = buildConsolidatedInsertSelect(
+  const insertSelectSql = buildConsolidatedInsertSelect(
     confirmedRules,
     dialect,
     tableName,
@@ -52,7 +106,8 @@ export function generateCleaningSQL(
     orderColumn,
     fullRowDedup,
     columnDedupRule,
-    dedupKeep
+    dedupKeep,
+    options.sourceWhereClause
   );
 
   const steps: SQLStep[] = [];
@@ -107,7 +162,7 @@ export function generateCleaningSQL(
     stepNumber: stepNum++,
     name: "执行清洗（单条 INSERT SELECT）",
     operationType: "INSERT",
-    sql: consolidatedSql,
+    sql: insertSelectSql,
     affectedRows: confirmedRules.reduce((sum, r) => sum + (r.affectedRows || 0), 0),
     estimatedTime: "< 10s",
     riskLevel: confirmedRules.some((r) => r.action === "dedup" || r.action === "remove") ? "high" : "medium",
@@ -124,6 +179,51 @@ export function generateCleaningSQL(
     riskLevel: "low",
   });
 
+  const errTable = problemTableName(tableName);
+  const shouldEmitProblem =
+    options.emitProblemTable !== false &&
+    confirmedRules.some(
+      (r) =>
+        r.parameters.emitToProblemTable === true ||
+        r.parameters.invalidAction === "reject" ||
+        r.parameters.unmatchedStrategy === "reject"
+    );
+
+  if (shouldEmitProblem) {
+    stepNum += 1;
+    steps.push({
+      stepNumber: stepNum,
+      name: "创建问题表",
+      operationType: "CREATE",
+      sql: buildProblemTableCreateSql(tableName, dialect),
+      affectedRows: 0,
+      estimatedTime: "< 1s",
+      riskLevel: "low",
+      rollbackSql: `DROP TABLE IF EXISTS ${quoteTable(errTable, dialect)};`,
+    });
+    const problemInsertSql = buildProblemRecordsInsertSql(
+      confirmedRules,
+      dialect,
+      tableName,
+      allColumns,
+      options.sourceWhereClause
+    );
+    if (problemInsertSql) {
+      stepNum += 1;
+      steps.push({
+        stepNumber: stepNum,
+        name: "写入问题记录",
+        operationType: "INSERT",
+        sql: problemInsertSql,
+        affectedRows: 0,
+        estimatedTime: "< 10s",
+        riskLevel: "medium",
+      });
+    }
+  }
+
+  const consolidatedSql = buildConsolidatedCleaningSql(steps);
+
   const totalAffectedRows = confirmedRules.reduce((sum, r) => sum + (r.affectedRows || 0), 0);
 
   return {
@@ -135,6 +235,7 @@ export function generateCleaningSQL(
     backupSql: generateBackupSQL(dialect, tableName, backupTableName),
     rollbackSql: generateRollbackSQL(dialect, outputTableName, backupTableName),
     totalAffectedRows,
+    problemTableName: shouldEmitProblem ? errTable : undefined,
   };
 }
 
@@ -147,7 +248,7 @@ function generatePassthroughSQL(
 ): SQLGenerationResult {
   const quotedSource = quoteTable(tableName, dialect);
   const quotedOutput = quoteTable(outputTableName, dialect);
-  const consolidatedSql = `INSERT INTO ${quotedOutput}\nSELECT * FROM ${quotedSource};`;
+  const insertSql = `INSERT INTO ${quotedOutput}\nSELECT * FROM ${quotedSource};`;
 
   const steps: SQLStep[] = [
     {
@@ -174,7 +275,7 @@ function generatePassthroughSQL(
       stepNumber: 2,
       name: "复制数据到清洗表（无规则直通）",
       operationType: "INSERT",
-      sql: consolidatedSql,
+      sql: insertSql,
       affectedRows: 0,
       estimatedTime: "< 10s",
       riskLevel: "low",
@@ -190,6 +291,8 @@ function generatePassthroughSQL(
       riskLevel: "low",
     },
   ];
+
+  const consolidatedSql = buildConsolidatedCleaningSql(steps);
 
   return {
     targetDialect: dialect,
@@ -240,7 +343,8 @@ function buildConsolidatedInsertSelect(
   orderColumn: string,
   fullRowDedup: boolean,
   columnDedupRule?: CleaningRule,
-  dedupKeep: string = "first"
+  dedupKeep: string = "first",
+  sourceWhereClause?: string
 ): string {
   const quotedSource = quoteTable(sourceTable, dialect);
   const quotedOutput = quoteTable(outputTable, dialect);
@@ -279,10 +383,44 @@ function buildConsolidatedInsertSelect(
     return `${col} IS NOT NULL`;
   });
 
+  // reject 策略：校验/码表未匹配行从结果集中排除
+  for (const rule of rules) {
+    if (rule.action !== "standardize") continue;
+    const col = quoteColumn(rule.field, dialect);
+    const expr = `src.${col}`;
+    const filterWhere = buildFilterKeepWhereSql(rule, expr, dialect);
+    if (filterWhere) {
+      whereClauses.push(filterWhere);
+      continue;
+    }
+    const rejectWhere = buildValidateRejectWhereSql(rule, expr, dialect);
+    if (rejectWhere) {
+      whereClauses.push(rejectWhere);
+      continue;
+    }
+    const type = rule.parameters.type as string | undefined;
+    if (type === "dictMap" || type === "fk_reference" || rule.parameters.fromCodeTable) {
+      const dictMap = resolveFieldDictMap(rule.parameters, rule.field);
+      if (
+        resolveUnmatchedStrategy(rule.parameters) === "reject" &&
+        Object.keys(dictMap).length > 0
+      ) {
+        const whitelist = rule.parameters.whitelist as string[] | undefined;
+        whereClauses.push(buildDictMapRejectWhereSql(expr, dictMap, whitelist));
+      }
+    }
+  }
+
+  if (sourceWhereClause && sourceWhereClause.trim()) {
+    whereClauses.unshift(`(${sourceWhereClause.trim()})`);
+  }
+
   const partitionCols = fullRowDedup
     ? columns.map((c) => quoteColumn(c, dialect))
     : columnDedupRule
-    ? [quoteColumn(columnDedupRule.field, dialect)]
+    ? buildPartitionDedupPartitionCols(columnDedupRule, columns, columnDedupRule.field).map((c) =>
+        quoteColumn(c, dialect)
+      )
     : [];
 
   const innerSelect = buildInnerSelect(
@@ -443,8 +581,13 @@ function buildFillNullExpression(
     }
     case "default":
     case "fixed":
-    default:
-      return `COALESCE(${nullishExpr}, ${formatValue(rule.parameters.fillValue ?? "UNKNOWN")})`;
+    default: {
+      const fillVal = rule.parameters.fillValue ?? "UNKNOWN";
+      if (rule.parameters.replaceAll === true) {
+        return formatValue(fillVal);
+      }
+      return `COALESCE(${nullishExpr}, ${formatValue(fillVal)})`;
+    }
   }
 }
 
@@ -473,11 +616,21 @@ function applyFormatExpression(expr: string, rule: CleaningRule, dialect: Databa
         return `REGEXP_REPLACE(${expr}, '[^0-9]', '')`;
       }
       return `REGEXP_REPLACE(${expr}, '[^0-9]', '', 'g')`;
-    case "DATE_ISO":
-      if (dialect === "mysql") {
-        return `DATE_FORMAT(STR_TO_DATE(${expr}, '%Y-%m-%d'), '%Y-%m-%d')`;
-      }
-      return `CAST(${expr} AS DATE)`;
+    case "DATE_ISO": {
+      const sourceFormats = resolveSourceFormats(rule.parameters);
+      return buildDateIsoSql(expr, sourceFormats, dialect);
+    }
+    case "HALFWIDTH":
+      return buildHalfwidthSql(expr);
+    case "strip_chars": {
+      const classes = (rule.parameters.charClasses as StripCharClass[] | undefined) ?? ["digit"];
+      return buildStripCharsSql(expr, classes);
+    }
+    case "substring": {
+      const start = (rule.parameters.start as number) ?? 1;
+      const end = rule.parameters.end as number | undefined;
+      return buildSubstringSql(expr, start, end);
+    }
     case "COLLAPSE_WS":
       if (dialect === "mysql") {
         return `REGEXP_REPLACE(TRIM(${expr}), '[[:space:]]+', ' ')`;
@@ -485,28 +638,13 @@ function applyFormatExpression(expr: string, rule: CleaningRule, dialect: Databa
       return `REGEXP_REPLACE(TRIM(${expr}), '\\s+', ' ', 'g')`;
     case "STRIP_HTML":
       return `REGEXP_REPLACE(${expr}, '<[^>]+>', '')`;
-    case "FULLWIDTH":
-      return buildFullwidthNormalizeSql(expr);
+    case "FULLWIDTH": {
+      const pairs = rule.parameters.detectedPairs as FullwidthCharPair[] | undefined;
+      return buildFullwidthNormalizeSql(expr, pairs);
+    }
     default:
       return `TRIM(${expr})`;
   }
-}
-
-function buildFullwidthNormalizeSql(expr: string): string {
-  let result = expr;
-  for (let i = 0; i <= 9; i += 1) {
-    const fw = String.fromCharCode(0xff10 + i);
-    result = `REPLACE(${result}, '${fw}', '${i}')`;
-  }
-  for (let i = 0; i < 26; i += 1) {
-    const fwUpper = String.fromCharCode(0xff21 + i);
-    const fwLower = String.fromCharCode(0xff41 + i);
-    const upper = String.fromCharCode(65 + i);
-    const lower = String.fromCharCode(97 + i);
-    result = `REPLACE(${result}, '${fwUpper}', '${upper}')`;
-    result = `REPLACE(${result}, '${fwLower}', '${lower}')`;
-  }
-  return result;
 }
 
 function buildCrossFieldSql(
@@ -599,17 +737,56 @@ function applyStandardizeExpression(
   ) {
     const min = rule.parameters.min ?? 0;
     const max = rule.parameters.max ?? 150;
-    return `CASE WHEN CAST(${expr} AS SIGNED) < ${min} OR CAST(${expr} AS SIGNED) > ${max} THEN NULL ELSE ${expr} END`;
+    const cond = `CAST(${expr} AS SIGNED) >= ${min} AND CAST(${expr} AS SIGNED) <= ${max}`;
+    if (rule.parameters.type === "range_validate") {
+      const wrapped = buildValidateExpressionSql(rule, expr, dialect);
+      if (wrapped) return wrapped;
+    }
+    return `CASE WHEN ${cond} THEN ${expr} ELSE NULL END`;
   }
 
   if (rule.parameters.type === "length_validate") {
+    const wrapped = buildValidateExpressionSql(rule, expr, dialect);
+    if (wrapped) return wrapped;
     const expected = (rule.parameters.expectedLength as number) ?? 11;
     return `CASE WHEN CHAR_LENGTH(TRIM(${expr})) = ${expected} THEN ${expr} ELSE NULL END`;
   }
 
   if (rule.parameters.type === "regex_validate") {
+    const wrapped = buildValidateExpressionSql(rule, expr, dialect);
+    if (wrapped) return wrapped;
     const pattern = String(rule.parameters.pattern ?? ".*").replace(/'/g, "''");
     return `CASE WHEN ${expr} REGEXP '${pattern}' THEN ${expr} ELSE NULL END`;
+  }
+
+  if (rule.parameters.type === "id_card_transform") {
+    const wrapped = buildValidateExpressionSql(rule, expr, dialect);
+    if (wrapped) return wrapped;
+  }
+
+  const numericSql = buildNumericValidateSql(rule, expr);
+  if (numericSql) return numericSql;
+
+  const entitySql = buildEntityValidateSql(rule, expr, dialect);
+  if (entitySql) return entitySql;
+
+  if (rule.parameters.type === "length_range") {
+    const wrapped = buildValidateExpressionSql(rule, expr, dialect);
+    if (wrapped) return wrapped;
+    const min = rule.parameters.minLength as number | undefined;
+    const max = rule.parameters.maxLength as number | undefined;
+    const trimmed = dialect === "postgresql" ? `TRIM(${expr}::text)` : `TRIM(${expr})`;
+    const parts: string[] = [];
+    if (min !== undefined) parts.push(`CHAR_LENGTH(${trimmed}) >= ${min}`);
+    if (max !== undefined) parts.push(`CHAR_LENGTH(${trimmed}) <= ${max}`);
+    if (parts.length > 0) {
+      return `CASE WHEN ${parts.join(" AND ")} THEN ${expr} ELSE NULL END`;
+    }
+  }
+
+  if (rule.parameters.type === "custom_expression") {
+    // P2-R6 defer：仅透传原值，表达式模板待 sandbox 实现
+    return expr;
   }
 
   if (rule.parameters.type === "cross_field") {
@@ -642,46 +819,53 @@ function applyStandardizeExpression(
     return expr;
   }
 
-  if (rule.parameters.type === "fk_reference") {
-    const dictMap = rule.parameters.dictMap as Record<string, string> | undefined;
+  if (
+    rule.parameters.type === "fk_reference" ||
+    rule.parameters.type === "dictMap" ||
+    rule.parameters.fromCodeTable
+  ) {
+    const dictMap = resolveFieldDictMap(rule.parameters, column);
     if (dictMap && Object.keys(dictMap).length > 0) {
-      const cases = Object.entries(dictMap)
-        .map(
-          ([k, v]) =>
-            `WHEN TRIM(${expr}) = '${k.replace(/'/g, "''")}' THEN '${String(v).replace(/'/g, "''")}'`
-        )
-        .join("\n           ");
-      return `CASE ${cases}\n           WHEN ${expr} IS NULL OR TRIM(${expr}) = '' THEN NULL\n           ELSE ${expr} END`;
+      const strategy = resolveUnmatchedStrategy(rule.parameters);
+      const whitelist = rule.parameters.whitelist as string[] | undefined;
+      const customValue = rule.parameters.customUnmatchedValue as string | undefined;
+      return buildDictMapCaseSql(expr, dictMap, strategy, whitelist, customValue);
     }
 
-    const allowed = rule.parameters.allowedValues as string[] | undefined;
-    if (allowed && allowed.length > 0) {
-      const inList = allowed.map((v) => `'${String(v).replace(/'/g, "''")}'`).join(", ");
-      return `CASE WHEN ${expr} IS NULL OR TRIM(${expr}) = '' THEN NULL WHEN ${expr} IN (${inList}) THEN ${expr} ELSE NULL END`;
-    }
+    if (rule.parameters.type === "fk_reference") {
+      const allowed = rule.parameters.allowedValues as string[] | undefined;
+      if (allowed && allowed.length > 0) {
+        const inList = allowed.map((v) => `'${String(v).replace(/'/g, "''")}'`).join(", ");
+        return `CASE WHEN ${expr} IS NULL OR TRIM(${expr}) = '' THEN NULL WHEN ${expr} IN (${inList}) THEN ${expr} ELSE NULL END`;
+      }
 
-    const dictTable = rule.parameters.dictTable as string | undefined;
-    if (dictTable) {
-      const quotedDict = quoteTable(dictTable, dialect);
-      const codeCol = quoteColumn(
-        (rule.parameters.dictCodeColumn as string) || "code",
-        dialect
-      );
-      const nameCol = quoteColumn(
-        (rule.parameters.dictNameColumn as string) || "name",
-        dialect
-      );
-      return `COALESCE((SELECT ${nameCol} FROM ${quotedDict} d WHERE d.${codeCol} = ${expr} LIMIT 1), ${expr})`;
+      const dictTable = rule.parameters.dictTable as string | undefined;
+      if (dictTable) {
+        const quotedDict = quoteTable(dictTable, dialect);
+        const codeCol = quoteColumn(
+          (rule.parameters.dictCodeColumn as string) || "code",
+          dialect
+        );
+        const nameCol = quoteColumn(
+          (rule.parameters.dictNameColumn as string) || "name",
+          dialect
+        );
+        return `COALESCE((SELECT ${nameCol} FROM ${quotedDict} d WHERE d.${codeCol} = ${expr} LIMIT 1), ${expr})`;
+      }
     }
 
     return `CASE WHEN ${expr} IS NULL OR TRIM(${expr}) = '' THEN NULL ELSE ${expr} END`;
   }
 
   if (rule.parameters.type === "email_validate") {
+    const wrapped = buildValidateExpressionSql(rule, expr, dialect);
+    if (wrapped) return wrapped;
     return `CASE WHEN ${expr} REGEXP '^[^@[:space:]]+@[^@[:space:]]+\\.[^@[:space:]]+$' THEN ${expr} ELSE NULL END`;
   }
 
   if (rule.parameters.type === "phone_validate") {
+    const wrapped = buildValidateExpressionSql(rule, expr, dialect);
+    if (wrapped) return wrapped;
     const cleaned = `REGEXP_REPLACE(${expr}, '[^0-9]', '')`;
     return `CASE WHEN CHAR_LENGTH(${cleaned}) BETWEEN 7 AND 15 THEN ${cleaned} ELSE NULL END`;
   }
@@ -708,6 +892,10 @@ function buildSplitExpression(rule: CleaningRule, dialect: DatabaseDialect): str
   const sourceCol = quoteColumn(rule.field, dialect);
   const targetCol = quoteColumn((rule.parameters.targetColumn as string) || `${rule.field}_domain`, dialect);
   const part = rule.parameters.part as string;
+
+  if (part === "derived_mapping") {
+    return `src.${sourceCol} AS ${targetCol}`;
+  }
 
   if (part === "domain") {
     if (dialect === "mysql") {
@@ -836,6 +1024,44 @@ function generateBackupSQL(dialect: DatabaseDialect, tableName: string, backupNa
 function generateRollbackSQL(dialect: DatabaseDialect, tableName: string, backupName: string): string {
   const qt = (t: string) => quoteTable(t, dialect);
   return `-- 完全回滚方案（谨慎使用）\n-- 1. 清空清洗后的表\nTRUNCATE TABLE ${qt(tableName)};\n\n-- 2. 从备份恢复\nINSERT INTO ${qt(tableName)}\nSELECT * FROM ${qt(backupName)};`;
+}
+
+/** 生成问题表 INSERT（各 reject 规则 UNION） */
+function buildProblemRecordsInsertSql(
+  rules: CleaningRule[],
+  dialect: DatabaseDialect,
+  sourceTable: string,
+  _columns: string[],
+  sourceWhereClause?: string
+): string | null {
+  const errTable = quoteTable(problemTableName(sourceTable), dialect);
+  const quotedSource = quoteTable(sourceTable, dialect);
+  const inserts: string[] = [];
+
+  for (const rule of rules) {
+    if (rule.action !== "standardize") continue;
+    const col = quoteColumn(rule.field, dialect);
+    const expr = `${col}`;
+    const filterWhere = buildFilterKeepWhereSql(rule, expr, dialect);
+    const validateWhere = buildValidateRejectWhereSql(rule, expr, dialect);
+    const keepWhere = filterWhere ?? validateWhere;
+    if (!keepWhere) continue;
+
+    // 非空且不满足保留条件 → 问题行
+    const rejectCond = `(NOT (${keepWhere}))`;
+    const ruleName = String(rule.name ?? rule.id).replace(/'/g, "''");
+    const errType = String(rule.parameters.type ?? "VALIDATE").replace(/'/g, "''");
+    const baseWhere = sourceWhereClause?.trim()
+      ? `WHERE (${sourceWhereClause.trim()}) AND ${rejectCond}`
+      : `WHERE ${rejectCond}`;
+
+    inserts.push(
+      `INSERT INTO ${errTable} (err_field, err_data, err_rule_name, err_type)\nSELECT '${rule.field.replace(/'/g, "''")}', CAST(${expr} AS CHAR), '${ruleName}', '${errType}'\nFROM ${quotedSource}\n${baseWhere}`
+    );
+  }
+
+  if (inserts.length === 0) return null;
+  return inserts.join(";\n\n");
 }
 
 export function validateSQL(sql: string): { valid: boolean; errors: string[] } {

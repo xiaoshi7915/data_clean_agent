@@ -1,6 +1,9 @@
 import { getFullSession } from "./sessionService";
+import { assertWritableRun, HistoricalRunWriteError } from "./pipelineRunService";
 import type { CleaningPhase } from "@contracts/types";
 import { isDatabaseSourceType, isDbExploreSupported, unsupportedDbMessage } from "@contracts/dataSourceSupport";
+
+export { HistoricalRunWriteError };
 
 export type PhaseAction = "explore" | "analyze" | "confirm" | "generate" | "execute";
 
@@ -14,7 +17,12 @@ export class PhaseValidationError extends Error {
 /**
  * 在执行阶段变更类 mutation 前校验前置条件
  */
-export async function validatePhaseTransition(sessionId: string, targetAction: PhaseAction) {
+export async function validatePhaseTransition(
+  sessionId: string,
+  targetAction: PhaseAction,
+  clientRunIndex?: number
+) {
+  await assertWritableRun(sessionId, clientRunIndex);
   const session = await getFullSession(sessionId);
   if (!session) {
     throw new PhaseValidationError("会话不存在，请重新创建对话");
@@ -53,10 +61,8 @@ export async function validatePhaseTransition(sessionId: string, targetAction: P
       break;
     }
     case "generate": {
-      const rules = session.cleaningRules ?? [];
-      const confirmed = rules.filter((r) => r.status === "confirmed");
-      if (confirmed.length === 0) {
-        throw new PhaseValidationError("请至少确认一条清洗规则后再生成 SQL");
+      if (!session.dataSource) {
+        throw new PhaseValidationError("请先连接数据源后再生成 SQL");
       }
       break;
     }

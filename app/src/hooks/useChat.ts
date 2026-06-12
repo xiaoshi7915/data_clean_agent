@@ -2,6 +2,17 @@ import { useCallback } from "react";
 import type { CleaningPhase, ChatMessage, ChatMessageAction, CleaningRule } from "@contracts/types";
 import type { CleaningSessionState } from "./cleaningSessionState";
 import { isDbSourceType } from "./cleaningSessionState";
+import { VIEW_PIPELINE_WITH_SQL_ACTIONS } from "@/lib/pipelineMessageActions";
+import {
+  bindActionsToRun,
+  actionsNeedPipelineSnapshot,
+} from "@/lib/chatActionRun";
+import {
+  historicalRunReadonlyMessage,
+  historicalRevisionReadonlyMessage,
+  isHistoricalRunView,
+  isHistoricalRevisionView,
+} from "./writableRunGuard";
 
 /** 聊天消息、发送与 Agent 动作 */
 export function useChat(state: CleaningSessionState) {
@@ -17,9 +28,16 @@ export function useChat(state: CleaningSessionState) {
     executionResult,
     messages,
     setMessages,
-    mutations: { saveMessageMut, chatSend },
+    viewingRunIndex,
+    currentRunIndex,
+    viewingRevisionIndex,
+    latestRevisionIndex,
+    setViewingRevisionIndex,
+    setLatestRevisionIndex,
+    mutations: { saveMessageMut, chatSend, createSnapshotMut },
     refreshLists,
     setCleaningRules,
+    setGeneratedSQL,
     utils,
   } = state;
 
@@ -36,26 +54,59 @@ export function useChat(state: CleaningSessionState) {
   );
 
   const pushMessage = useCallback(
-    (
+    async (
       sid: string,
       role: ChatMessage["role"],
       content: string,
       phase: CleaningPhase,
-      actions?: ChatMessageAction[]
+      actions?: ChatMessageAction[],
+      runIndex: number = currentRunIndex
     ) => {
+      let revisionIndex: number | undefined;
+      if (actions?.length && actionsNeedPipelineSnapshot(actions)) {
+        try {
+          const snap = await createSnapshotMut.mutateAsync({
+            sessionId: sid,
+            runIndex,
+            trigger: "chat_milestone",
+          });
+          if (snap.success && snap.revisionIndex > 0) {
+            revisionIndex = snap.revisionIndex;
+            setLatestRevisionIndex(snap.revisionIndex);
+            setViewingRevisionIndex(null);
+          }
+        } catch (err) {
+          console.error("Failed to create pipeline snapshot:", err);
+        }
+      }
+
+      const boundActions = actions?.length
+        ? bindActionsToRun(actions, runIndex, revisionIndex)
+        : undefined;
       const msg: ChatMessage = {
         id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
         role,
         phase,
         content,
         timestamp: new Date().toISOString(),
-        actions,
+        metadata: {
+          runIndex,
+          ...(revisionIndex != null ? { revisionIndex } : {}),
+        },
+        actions: boundActions,
       };
       setMessages((prev) => [...prev, msg]);
       void persistMessage(sid, msg);
       return msg;
     },
-    [persistMessage, setMessages]
+    [
+      persistMessage,
+      setMessages,
+      currentRunIndex,
+      createSnapshotMut,
+      setLatestRevisionIndex,
+      setViewingRevisionIndex,
+    ]
   );
 
   const addMessage = useCallback(
@@ -66,20 +117,23 @@ export function useChat(state: CleaningSessionState) {
       actions?: ChatMessageAction[]
     ) => {
       if (sessionId) {
-        return pushMessage(sessionId, role, content, phase, actions);
+        void pushMessage(sessionId, role, content, phase, actions, currentRunIndex);
+        return undefined;
       }
+      const boundActions = actions?.length ? bindActionsToRun(actions, currentRunIndex) : undefined;
       const msg: ChatMessage = {
         id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
         role,
         phase,
         content,
         timestamp: new Date().toISOString(),
-        actions,
+        metadata: { runIndex: currentRunIndex },
+        actions: boundActions,
       };
       setMessages((prev) => [...prev, msg]);
       return msg;
     },
-    [sessionId, currentPhase, pushMessage, setMessages]
+    [sessionId, currentPhase, currentRunIndex, pushMessage, setMessages]
   );
 
   const buildRestoredMessages = useCallback(
@@ -94,7 +148,8 @@ export function useChat(state: CleaningSessionState) {
         cleaningRules?: CleaningRule[];
         generatedSQL?: typeof generatedSQL;
         executionResult?: typeof executionResult;
-      }
+      },
+      runIndex = 1
     ): ChatMessage[] => {
       const restored: ChatMessage[] = [];
       const ts = () => new Date().toISOString();
@@ -109,7 +164,8 @@ export function useChat(state: CleaningSessionState) {
         phase,
         content,
         timestamp: ts(),
-        actions,
+        metadata: { runIndex },
+        actions: actions?.length ? bindActionsToRun(actions, runIndex) : undefined,
       });
 
       if (session.dataSource) {
@@ -120,13 +176,13 @@ export function useChat(state: CleaningSessionState) {
               "agent",
               `会话已恢复。数据源：${session.dataSource.name}\n\n${
                 session.targetTable
-                  ? `已选表：**${session.targetTable}**，可继续探查或查看进度。`
-                  : "请点击 **「选择数据表」** 继续。"
+                  ? `已选表：**${session.targetTable}**，请点击 **「选择数据表」** 后点击 **「开始探查」** 或 **「一键生成SQL」**。`
+                  : "请点击 **「选择数据表」**，选中表后点击 **「开始探查」** 或 **「一键生成SQL」**。"
               }`,
               "explore",
               session.targetTable
                 ? [
-                    { id: "start-explore", label: "开始探查", type: "startExplore" },
+                    { id: "select-table", label: "选择数据表", type: "selectTable" },
                     { id: "run-full-pipeline-table", label: "一键生成SQL", type: "runFullPipeline" },
                   ]
                 : [
@@ -135,7 +191,6 @@ export function useChat(state: CleaningSessionState) {
                       id: "run-full-pipeline-db",
                       label: "整库一键生成SQL",
                       type: "runFullPipeline",
-                      disabled: true,
                     },
                   ]
             )
@@ -144,7 +199,7 @@ export function useChat(state: CleaningSessionState) {
           restored.push(
             mk(
               "agent",
-              `会话已恢复。数据源：${session.dataSource.name}\n\n请点击 **「开始探查」** 分析上传的文件。`,
+              `会话已恢复。数据源：${session.dataSource.name}\n\n点击 **「开始探查」** 查看质量报告，或 **「一键生成SQL」** 直接生成清洗方案。`,
               "explore",
               [
                 { id: "start-explore", label: "开始探查", type: "startExplore" },
@@ -155,7 +210,7 @@ export function useChat(state: CleaningSessionState) {
         }
       }
 
-      if (session.explorationResult) {
+      if (session.explorationResult && !session.qualityReport) {
         const er = session.explorationResult;
         restored.push(
           mk(
@@ -170,7 +225,28 @@ export function useChat(state: CleaningSessionState) {
         );
       }
 
-      if (session.qualityReport) {
+      if (session.qualityReport && !session.generatedSQL) {
+        const qr = session.qualityReport;
+        const er = session.explorationResult;
+        const rules = session.cleaningRules ?? [];
+        const tableLabel = er?.sourceName ?? session.targetTable ?? "数据表";
+        restored.push(
+          mk(
+            "agent",
+            `🔍 **探查与分析完成！**\n\n表 **${tableLabel}** · **质量评分：${qr.score.overall}/100**${
+              rules.length > 0
+                ? `\n\n已推荐 **${rules.length}** 条清洗规则。`
+                : "\n\n数据质量良好，暂无清洗建议。"
+            }`,
+            "confirm",
+            [
+              { id: "view-explore", label: "查看探查报告", type: "viewExplore" },
+              { id: "view-quality", label: "查看质量报告", type: "viewQuality" },
+              { id: "view-rules", label: "查看清洗规则", type: "viewRules" },
+            ]
+          )
+        );
+      } else if (session.qualityReport && session.generatedSQL) {
         const qr = session.qualityReport;
         const rules = session.cleaningRules ?? [];
         const confirmed = rules.filter((r) => r.status === "confirmed").length;
@@ -202,7 +278,7 @@ export function useChat(state: CleaningSessionState) {
             "agent",
             `📝 SQL 生成完成！共 ${session.generatedSQL.steps.length} 个步骤，输出表：**${session.generatedSQL.targetTable}**`,
             "generate",
-            [{ id: "view-sql", label: "查看清洗SQL", type: "viewSQL" }]
+            VIEW_PIPELINE_WITH_SQL_ACTIONS
           )
         );
       }
@@ -227,6 +303,22 @@ export function useChat(state: CleaningSessionState) {
 
   const sendChatMessage = useCallback(
     async (userMessage: string) => {
+      if (sessionId && isHistoricalRunView(viewingRunIndex, currentRunIndex)) {
+        const msg = historicalRunReadonlyMessage(viewingRunIndex, currentRunIndex);
+        void pushMessage(sessionId, "agent", msg, currentPhase);
+        return null;
+      }
+      if (
+        sessionId &&
+        isHistoricalRevisionView(viewingRevisionIndex, latestRevisionIndex)
+      ) {
+        const msg = historicalRevisionReadonlyMessage(
+          viewingRevisionIndex!,
+          latestRevisionIndex
+        );
+        void pushMessage(sessionId, "agent", msg, currentPhase);
+        return null;
+      }
       const confirmedRulesCount = cleaningRules.filter((r) => r.status === "confirmed").length;
       const context = {
         phase: currentPhase,
@@ -260,22 +352,33 @@ export function useChat(state: CleaningSessionState) {
         });
 
         const actions: ChatMessageAction[] = result.action
-          ? [result.action as ChatMessageAction]
+          ? bindActionsToRun([result.action as ChatMessageAction], currentRunIndex)
           : [];
 
         if (sessionId) {
-          pushMessage(sessionId, "agent", result.message, currentPhase, actions);
+          void pushMessage(sessionId, "agent", result.message, currentPhase, actions, currentRunIndex);
         } else {
           addMessage("agent", result.message, currentPhase, actions);
         }
 
         if (sessionId && result.ruleUpdatesApplied && result.ruleUpdatesApplied > 0) {
+          setViewingRevisionIndex(null);
           try {
-            const full = await utils.session.getFull.fetch({ sessionId });
-            if (full.found && full.session?.cleaningRules?.length) {
+            const full = await utils.session.getFull.fetch({
+              sessionId,
+              runIndex: currentRunIndex,
+            });
+            if (full.found && full.session?.cleaningRules) {
               setCleaningRules(full.session.cleaningRules);
+              setGeneratedSQL(null);
+              if (full.session.latestRevisionIndex != null) {
+                setLatestRevisionIndex(full.session.latestRevisionIndex);
+              }
             } else {
-              const rulesRes = await utils.rules.getBySession.fetch({ sessionId });
+              const rulesRes = await utils.rules.getBySession.fetch({
+                sessionId,
+                runIndex: currentRunIndex,
+              });
               if (rulesRes.rules?.length) {
                 setCleaningRules(
                   rulesRes.rules.map((r) => ({
@@ -294,6 +397,7 @@ export function useChat(state: CleaningSessionState) {
                     riskNote: r.riskNote || undefined,
                   }))
                 );
+                setGeneratedSQL(null);
               }
             }
           } catch (refreshErr) {
@@ -312,7 +416,7 @@ export function useChat(state: CleaningSessionState) {
       } catch (err) {
         const fallback = "对话服务暂时不可用，请使用消息下方的快捷按钮继续操作。";
         if (sessionId) {
-          pushMessage(sessionId, "agent", fallback, currentPhase);
+          void pushMessage(sessionId, "agent", fallback, currentPhase);
         } else {
           addMessage("agent", fallback, currentPhase);
         }
@@ -322,6 +426,10 @@ export function useChat(state: CleaningSessionState) {
     },
     [
       sessionId,
+      viewingRunIndex,
+      currentRunIndex,
+      viewingRevisionIndex,
+      latestRevisionIndex,
       currentPhase,
       dataSource,
       targetTable,
@@ -334,9 +442,11 @@ export function useChat(state: CleaningSessionState) {
       chatSend,
       pushMessage,
       addMessage,
-      utils.rules.getBySession,
-      utils.session.getFull,
+      utils,
       setCleaningRules,
+      setGeneratedSQL,
+      setViewingRevisionIndex,
+      setLatestRevisionIndex,
     ]
   );
 
@@ -345,6 +455,7 @@ export function useChat(state: CleaningSessionState) {
     addMessage,
     buildRestoredMessages,
     sendChatMessage,
+    persistMessage,
   };
 }
 

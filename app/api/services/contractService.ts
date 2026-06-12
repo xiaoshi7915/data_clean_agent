@@ -1,6 +1,7 @@
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { getDb } from "../queries/connection";
 import { cleaningRules, cleaningSessions } from "@db/schema";
+import { getCurrentRunIndex } from "./pipelineRunService";
 import {
   contractToRules,
   parseCleaningContract,
@@ -90,12 +91,18 @@ export async function importContractToSession(
   const contract = parseCleaningContract(source, format);
   const rules = contractToRules(contract);
   const db = getDb();
+  const runIndex = await getCurrentRunIndex(sessionId);
 
-  await db.delete(cleaningRules).where(eq(cleaningRules.sessionId, sessionId));
+  await db
+    .delete(cleaningRules)
+    .where(
+      and(eq(cleaningRules.sessionId, sessionId), eq(cleaningRules.runIndex, runIndex))
+    );
 
   for (const rule of rules) {
     await db.insert(cleaningRules).values({
       sessionId,
+      runIndex,
       ruleId: rule.id,
       ruleIndex: rule.index,
       name: rule.name,

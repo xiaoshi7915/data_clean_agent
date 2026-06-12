@@ -7,7 +7,7 @@ import path from "node:path";
 import { appRouter } from "./router";
 import { createContext } from "./context";
 import { env } from "./lib/env";
-import { saveUploadedFile, MAX_UPLOAD_BYTES } from "./services/uploadService";
+import { saveUploadedFile, MAX_UPLOAD_BYTES, type UploadKind } from "./services/uploadService";
 import { checkRateLimit, rateLimitKeyFromRequest, RateLimitError } from "./lib/rateLimit";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
@@ -30,6 +30,7 @@ app.post("/api/upload", async (c) => {
     const formData = await c.req.formData();
     const file = formData.get("file") as File | null;
     const sessionId = formData.get("sessionId") as string | null;
+    const uploadKind = formData.get("uploadKind") as string | null;
 
     if (!file) {
       return c.json({ success: false, error: "No file provided" }, 400);
@@ -42,10 +43,9 @@ app.post("/api/upload", async (c) => {
       );
     }
 
-    const result = await saveUploadedFile(
-      sessionId || undefined,
-      file
-    );
+    const result = await saveUploadedFile(sessionId || undefined, file, {
+      uploadKind: uploadKind ? (uploadKind as UploadKind) : undefined,
+    });
 
     return c.json({
       success: true,
@@ -53,6 +53,7 @@ app.post("/api/upload", async (c) => {
       fileType: result.fileType,
       fileName: result.fileName,
       fileSize: result.fileSize,
+      uploadKind: result.uploadKind,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

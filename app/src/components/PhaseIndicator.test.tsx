@@ -37,7 +37,7 @@ describe("PhaseIndicator", () => {
         onRetryClick={onRetry}
       />
     );
-    fireEvent.click(screen.getByTitle("重新开始选表流程"));
+    fireEvent.click(screen.getByTitle("在本对话中重置清洗流程"));
     expect(onRetry).toHaveBeenCalledTimes(1);
   });
 });

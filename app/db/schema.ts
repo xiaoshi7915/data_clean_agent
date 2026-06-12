@@ -39,6 +39,8 @@ export const savedDataSources = mysqlTable("saved_data_sources", {
   filePath: varchar("file_path", { length: 500 }),
   createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow().onUpdateNow(),
+  /** 逻辑删除时间；非空表示已从侧栏隐藏，历史会话仍可关联 */
+  deletedAt: timestamp("deleted_at"),
 });
 
 // ---- Cleaning Sessions ----
@@ -69,6 +71,8 @@ export const cleaningSessions = mysqlTable("cleaning_sessions", {
   ]),
   dataSourceName: varchar("data_source_name", { length: 255 }),
   targetTable: varchar("target_table", { length: 255 }),
+  /** 源表预过滤 WHERE 子句（不含 WHERE 关键字） */
+  sourceWhereClause: text("source_where_clause"),
   dbHost: varchar("db_host", { length: 255 }),
   dbPort: int("db_port"),
   dbDatabase: varchar("db_database", { length: 255 }),
@@ -77,6 +81,8 @@ export const cleaningSessions = mysqlTable("cleaning_sessions", {
   fileType: mysqlEnum("file_type", ["csv", "json", "xml", "xlsx"]),
   filePath: varchar("file_path", { length: 500 }),
   retryCount: int("retry_count").notNull().default(0),
+  /** 当前活跃的运行序号（重试递增，历史 run 只读保留） */
+  currentRunIndex: int("current_run_index").notNull().default(1),
   lastAction: varchar("last_action", { length: 100 }),
   /** 最近一次导出的清洗契约 YAML 快照 */
   contractYaml: text("contract_yaml"),
@@ -88,6 +94,7 @@ export const cleaningSessions = mysqlTable("cleaning_sessions", {
 export const explorationResults = mysqlTable("exploration_results", {
   id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull().default(1),
   sourceType: varchar("source_type", { length: 50 }).notNull(),
   sourceName: varchar("source_name", { length: 255 }).notNull(),
   totalRows: int("total_rows").notNull(),
@@ -103,6 +110,9 @@ export const explorationResults = mysqlTable("exploration_results", {
 export const qualityReports = mysqlTable("quality_reports", {
   id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull().default(1),
+  /** 报告阶段：before=清洗前基线，after=清洗后对比 */
+  phase: mysqlEnum("phase", ["before", "after"]).notNull().default("before"),
   overallScore: int("overall_score").notNull(),
   completenessScore: int("completeness_score").notNull(),
   uniquenessScore: int("uniqueness_score").notNull(),
@@ -120,6 +130,7 @@ export const qualityReports = mysqlTable("quality_reports", {
 export const cleaningRules = mysqlTable("cleaning_rules", {
   id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull().default(1),
   ruleId: varchar("rule_id", { length: 50 }).notNull(),
   ruleIndex: int("rule_index").notNull(),
   name: varchar("name", { length: 255 }).notNull(),
@@ -151,6 +162,7 @@ export const cleaningRules = mysqlTable("cleaning_rules", {
 export const sqlSteps = mysqlTable("sql_steps", {
   id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull().default(1),
   stepNumber: int("step_number").notNull(),
   name: varchar("name", { length: 255 }).notNull(),
   operationType: mysqlEnum("operation_type", ["CREATE", "UPDATE", "DELETE", "INSERT", "SELECT"]).notNull(),
@@ -166,6 +178,7 @@ export const sqlSteps = mysqlTable("sql_steps", {
 export const executionLogs = mysqlTable("execution_logs", {
   id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull().default(1),
   executionId: varchar("execution_id", { length: 64 }).notNull(),
   overallStatus: mysqlEnum("overall_status", ["pending", "running", "success", "failed", "partial"]).notNull(),
   stepResults: json("step_results"),
@@ -182,6 +195,7 @@ export const executionLogs = mysqlTable("execution_logs", {
 export const chatMessages = mysqlTable("chat_messages", {
   id: autoId(),
   sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull().default(1),
   messageId: varchar("message_id", { length: 64 }).notNull(),
   role: mysqlEnum("role", ["agent", "user", "system"]).notNull(),
   phase: mysqlEnum("phase", [
@@ -195,6 +209,26 @@ export const chatMessages = mysqlTable("chat_messages", {
   ]).notNull().default("idle"),
   content: text("content").notNull(),
   metadata: json("metadata"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ---- Pipeline Snapshots（同 run 内规则/SQL 里程碑） ----
+export const pipelineSnapshots = mysqlTable("pipeline_snapshots", {
+  id: autoId(),
+  sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull().default(1),
+  revisionIndex: int("revision_index").notNull(),
+  trigger: varchar("trigger", { length: 64 }),
+  rules: json("rules").notNull(),
+  generatedSql: json("generated_sql"),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
+});
+
+// ---- Pipeline Runs（会话内重试版本） ----
+export const pipelineRuns = mysqlTable("pipeline_runs", {
+  id: autoId(),
+  sessionId: varchar("session_id", { length: 64 }).notNull(),
+  runIndex: int("run_index").notNull(),
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
@@ -247,4 +281,6 @@ export type SQLStepRecord = typeof sqlSteps.$inferSelect;
 export type ExecutionLogRecord = typeof executionLogs.$inferSelect;
 export type ChatMessageRecord = typeof chatMessages.$inferSelect;
 export type FileUploadRecord = typeof fileUploads.$inferSelect;
+export type PipelineSnapshotRecord = typeof pipelineSnapshots.$inferSelect;
+export type PipelineRunRecord = typeof pipelineRuns.$inferSelect;
 export type OrchestrationRunRecord = typeof orchestrationRuns.$inferSelect;

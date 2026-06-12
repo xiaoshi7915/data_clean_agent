@@ -118,7 +118,11 @@ export interface OrchestratorContext {
   state: OrchestratorState;
   input: AgentInput;
   exploration?: ExplorationResult;
+  /** 探查结果已写入 exploration_results */
+  explorationRef?: boolean;
   qualityReport?: QualityReport;
+  /** 质量报告与规则已写入会话表 */
+  qualityReportRef?: boolean;
   rules?: CleaningRule[];
   sqlResult?: SQLGenerationResult;
   verifyResult?: VerifyAgentOutput;

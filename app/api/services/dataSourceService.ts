@@ -33,6 +33,7 @@ import { ExplorationMetricCollector } from "../../engine/metrics/metricSqlBuilde
 import { mysqlDialect } from "../../engine/sql/mysqlDialect";
 import { getDataSourcePlugin } from "../../engine/datasource/plugin";
 import { unsupportedDbMessage } from "@contracts/dataSourceSupport";
+import { resolveExistingUploadPath } from "./uploadPathService";
 import "../../engine/datasource/mysqlPlugin";
 import "../../engine/datasource/postgresPlugin";
 import "../../engine/datasource/sqlitePlugin";
@@ -50,8 +51,55 @@ type SessionDbPool =
 
 const connectionPools = new Map<string, SessionDbPool>();
 
-/** 按方言创建会话级连接池 */
-export async function createConnectionForDialect(
+/** 记录各会话连接对应的配置指纹，配置未变时可复用连接池 */
+const connectionConfigKeys = new Map<string, string>();
+
+/** 同一会话并发建连时串行化，避免 A 关闭 B 正在使用的池导致 Pool is closed */
+const connectionLocks = new Map<string, Promise<SessionDbPool>>();
+
+function buildConfigKey(config: DBConnectionConfig, dialect: DatabaseDialect): string {
+  return `${dialect}|${config.host}|${config.port}|${config.database}|${config.username}|${config.password}`;
+}
+
+/** 探测会话连接池是否仍可用（已 end 的池会在此返回 false） */
+async function isSessionPoolHealthy(entry: SessionDbPool): Promise<boolean> {
+  try {
+    switch (entry.dialect) {
+      case "mysql": {
+        const conn = await entry.pool.getConnection();
+        conn.release();
+        return true;
+      }
+      case "postgresql": {
+        const client = await entry.pool.connect();
+        client.release();
+        return true;
+      }
+      case "sqlite": {
+        entry.db.prepare("SELECT 1").get();
+        return true;
+      }
+      case "sqlserver": {
+        await entry.pool.request().query("SELECT 1");
+        return true;
+      }
+      case "oracle": {
+        const connection = await entry.pool.getConnection();
+        await connection.close();
+        return true;
+      }
+      default: {
+        const _exhaustive: never = entry;
+        return Boolean(_exhaustive);
+      }
+    }
+  } catch {
+    return false;
+  }
+}
+
+/** 内部：无条件关闭并重建连接池 */
+async function createFreshConnectionForDialect(
   sessionId: string,
   config: DBConnectionConfig,
   dialect: DatabaseDialect = "mysql"
@@ -72,6 +120,7 @@ export async function createConnectionForDialect(
     client.release();
     const entry: SessionDbPool = { dialect: "postgresql", pool };
     connectionPools.set(sessionId, entry);
+    connectionConfigKeys.set(sessionId, buildConfigKey(config, dialect));
     return entry;
   }
 
@@ -84,6 +133,7 @@ export async function createConnectionForDialect(
     db.prepare("SELECT 1").get();
     const entry: SessionDbPool = { dialect: "sqlite", db };
     connectionPools.set(sessionId, entry);
+    connectionConfigKeys.set(sessionId, buildConfigKey(config, dialect));
     return entry;
   }
 
@@ -100,6 +150,7 @@ export async function createConnectionForDialect(
     }).connect();
     const entry: SessionDbPool = { dialect: "sqlserver", pool };
     connectionPools.set(sessionId, entry);
+    connectionConfigKeys.set(sessionId, buildConfigKey(config, dialect));
     return entry;
   }
 
@@ -115,6 +166,7 @@ export async function createConnectionForDialect(
     await connection.close();
     const entry: SessionDbPool = { dialect: "oracle", pool };
     connectionPools.set(sessionId, entry);
+    connectionConfigKeys.set(sessionId, buildConfigKey(config, dialect));
     return entry;
   }
 
@@ -135,7 +187,42 @@ export async function createConnectionForDialect(
 
   const entry: SessionDbPool = { dialect: "mysql", pool };
   connectionPools.set(sessionId, entry);
+  connectionConfigKeys.set(sessionId, buildConfigKey(config, dialect));
   return entry;
+}
+
+/** 按方言获取或创建会话级连接池（复用健康池，避免探查结束误关池） */
+export async function createConnectionForDialect(
+  sessionId: string,
+  config: DBConnectionConfig,
+  dialect: DatabaseDialect = "mysql"
+): Promise<SessionDbPool> {
+  const configKey = buildConfigKey(config, dialect);
+  const existing = connectionPools.get(sessionId);
+
+  if (
+    existing &&
+    existing.dialect === dialect &&
+    connectionConfigKeys.get(sessionId) === configKey &&
+    (await isSessionPoolHealthy(existing))
+  ) {
+    return existing;
+  }
+
+  const pending = connectionLocks.get(sessionId);
+  if (pending) {
+    return pending;
+  }
+
+  const createPromise = createFreshConnectionForDialect(sessionId, config, dialect);
+  connectionLocks.set(sessionId, createPromise);
+  try {
+    return await createPromise;
+  } finally {
+    if (connectionLocks.get(sessionId) === createPromise) {
+      connectionLocks.delete(sessionId);
+    }
+  }
 }
 
 /** 创建 MySQL 连接池（兼容旧调用方） */
@@ -191,6 +278,7 @@ export async function closeConnection(sessionId: string): Promise<void> {
     }
   }
   connectionPools.delete(sessionId);
+  connectionConfigKeys.delete(sessionId);
 }
 
 export function getConnection(sessionId: string): mysql.Pool | undefined {
@@ -428,8 +516,7 @@ export async function exploreDatabase(
     });
   }
 
-  await closeConnection(sessionId);
-
+  // 探查结束后保持会话连接池，供后续 SQL 执行/校验复用；仅在 cleanupSession 时关闭
   return {
     sourceType: "mysql",
     sourceName: `${config.database}.${safeTable}`,
@@ -859,15 +946,16 @@ export async function exploreFile(
   fileType: FileType,
   previewRows: number = 100
 ): Promise<ExplorationResult> {
+  const resolvedPath = resolveExistingUploadPath(filePath);
   switch (fileType) {
     case "csv":
-      return parseCSVFile(filePath, previewRows);
+      return parseCSVFile(resolvedPath, previewRows);
     case "json":
-      return parseJSONFile(filePath, previewRows);
+      return parseJSONFile(resolvedPath, previewRows);
     case "xlsx":
-      return parseXLSXFile(filePath, previewRows);
+      return parseXLSXFile(resolvedPath, previewRows);
     case "xml":
-      return parseXMLFile(filePath, previewRows);
+      return parseXMLFile(resolvedPath, previewRows);
     default:
       throw new Error(`Unsupported file type: ${fileType}`);
   }

@@ -1,6 +1,5 @@
 import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -12,6 +11,13 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
   Database,
   Plus,
   Clock,
@@ -21,6 +27,8 @@ import {
   Trash2,
   Pencil,
   Sparkles,
+  MoreHorizontal,
+  Inbox,
 } from "lucide-react";
 import {
   Select,
@@ -40,6 +48,7 @@ interface SidebarProps {
   onNewConversation: (dataSourceId: string) => void;
   onDeleteSession: (sessionId: string) => void;
   onEditDataSource?: (dataSourceId: string) => void;
+  onDeleteDataSource?: (dataSourceId: string) => void;
   onGoHome: () => void;
 }
 
@@ -53,10 +62,13 @@ const phaseLabel: Record<CleaningPhase, string> = {
   retry: "重试",
 };
 
-function sourceSubtitle(source: SavedDataSourceItem): string {
-  if (source.fileName) return source.fileName;
-  if (source.dbDatabase) return `${source.type} · ${source.dbDatabase}`;
-  return source.type;
+function sourceSubtitle(source: SavedDataSourceItem, sessionCount: number): string {
+  const base = source.fileName
+    ? source.fileName
+    : source.dbDatabase
+      ? `${source.type} · ${source.dbDatabase}`
+      : source.type;
+  return `${base} · ${sessionCount} 个对话`;
 }
 
 function formatRelativeTime(iso: string): string {
@@ -76,6 +88,14 @@ function sessionLabel(session: SessionListItem): string {
   return session.dataSourceName || session.sessionId.slice(0, 20);
 }
 
+/** 会话行删除按钮：outline 变体保证图标始终可见 */
+const sessionDeleteBtnClass =
+  "h-8 w-8 shrink-0 border-border/60 text-foreground hover:text-destructive hover:border-destructive/40 hover:bg-destructive/10";
+
+/** 数据源行「更多」菜单触发器：固定尺寸、高对比度 */
+const sourceMenuTriggerClass =
+  "h-8 w-8 shrink-0 border-border/60 bg-muted/40 text-foreground hover:bg-muted hover:text-foreground";
+
 function SessionItem({
   session,
   isActive,
@@ -89,8 +109,10 @@ function SessionItem({
 }) {
   return (
     <div
-      className={`group flex items-stretch gap-0 rounded-md transition-colors overflow-visible pr-0.5 ${
-        isActive ? "bg-primary/10" : "hover:bg-accent"
+      className={`flex items-stretch gap-1 rounded-lg transition-colors ${
+        isActive
+          ? "bg-primary/12 ring-1 ring-primary/25 shadow-sm"
+          : "hover:bg-accent/70"
       }`}
     >
       <button
@@ -105,12 +127,13 @@ function SessionItem({
           {phaseLabel[session.currentPhase]} · {formatRelativeTime(session.updatedAt)}
         </p>
       </button>
-      <div className="flex shrink-0 w-8 items-center justify-center">
+      <div className="flex shrink-0 items-center pr-1">
         <Button
-          variant="ghost"
-          size="icon"
-          className="h-7 w-7 shrink-0 opacity-60 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
+          variant="outline"
+          size="icon-sm"
+          className={sessionDeleteBtnClass}
           title="删除对话"
+          aria-label="删除对话"
           onClick={(e) => {
             e.stopPropagation();
             onDelete();
@@ -123,6 +146,71 @@ function SessionItem({
   );
 }
 
+/** 数据源行右侧「⋯」操作菜单，避免窄侧栏时三枚图标被挤出视口 */
+function DataSourceActions({
+  onEdit,
+  onNewConversation,
+  onDelete,
+}: {
+  onEdit?: () => void;
+  onNewConversation: () => void;
+  onDelete?: () => void;
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="icon-sm"
+          className={sourceMenuTriggerClass}
+          title="数据源操作"
+          aria-label="数据源操作"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <MoreHorizontal className="w-4 h-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-44">
+        {onEdit && (
+          <DropdownMenuItem
+            onClick={(e) => {
+              e.stopPropagation();
+              onEdit();
+            }}
+          >
+            <Pencil className="w-4 h-4 mr-2" />
+            编辑数据源
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuItem
+          onClick={(e) => {
+            e.stopPropagation();
+            onNewConversation();
+          }}
+        >
+          <MessageCircle className="w-4 h-4 mr-2" />
+          新建对话
+        </DropdownMenuItem>
+        {onDelete && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              variant="destructive"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete();
+              }}
+            >
+              <Trash2 className="w-4 h-4 mr-2" />
+              删除数据源
+            </DropdownMenuItem>
+          </>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
 export function Sidebar({
   currentSessionId,
   sessionList,
@@ -132,10 +220,12 @@ export function Sidebar({
   onNewConversation,
   onDeleteSession,
   onEditDataSource,
+  onDeleteDataSource,
   onGoHome,
 }: SidebarProps) {
   const [expandedSources, setExpandedSources] = useState<Record<string, boolean>>({});
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [pendingDeleteSourceId, setPendingDeleteSourceId] = useState<string | null>(null);
 
   const sessionsBySource = useMemo(() => {
     const map = new Map<string, SessionListItem[]>();
@@ -152,6 +242,7 @@ export function Sidebar({
   };
 
   const pendingSession = sessionList.find((s) => s.sessionId === pendingDeleteId);
+  const pendingSource = savedDataSources.find((s) => s.dataSourceId === pendingDeleteSourceId);
 
   return (
     <div className="flex flex-col h-full bg-card/40">
@@ -159,7 +250,7 @@ export function Sidebar({
         <button
           type="button"
           onClick={onGoHome}
-          className="w-full text-left px-1 py-1 -mx-1 rounded-md cursor-pointer transition-colors hover:bg-sky-50/80 dark:hover:bg-sky-950/30 group"
+          className="w-full text-left px-1 py-1 -mx-1 rounded-lg cursor-pointer transition-colors hover:bg-sky-50/80 dark:hover:bg-sky-950/30 group"
           title="返回首页"
         >
           <div className="flex items-center gap-2.5">
@@ -179,68 +270,74 @@ export function Sidebar({
       </div>
 
       <div className="flex-1 overflow-hidden flex flex-col min-h-0">
-        <div className="p-4 pb-2">
-          <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1.5">
+        <div className="px-4 pb-2 pt-3">
+          <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
             <Database className="w-3 h-3" />
             已保存数据源
           </h3>
         </div>
-        <ScrollArea className="flex-1 px-4">
+
+        {/* 不用 ScrollArea，避免 Radix viewport 裁剪右侧操作区 */}
+        <div className="flex-1 overflow-y-auto overflow-x-visible min-h-0 px-4">
           {savedDataSources.length === 0 ? (
-            <p className="text-xs text-muted-foreground py-4 text-center">连接后将自动保存数据源</p>
+            <div className="flex flex-col items-center justify-center py-10 px-3 text-center rounded-lg border border-dashed bg-muted/20">
+              <Inbox className="w-8 h-8 text-muted-foreground/50 mb-2" />
+              <p className="text-xs text-muted-foreground">连接后将自动保存数据源</p>
+              <p className="text-[10px] text-muted-foreground/70 mt-1">点击上方按钮开始</p>
+            </div>
           ) : (
-            <div className="space-y-1 pb-4">
+            <div className="space-y-2 pb-4">
               {savedDataSources.map((source) => {
                 const sessions = sessionsBySource.get(source.dataSourceId) || [];
                 const expanded = expandedSources[source.dataSourceId] ?? true;
                 return (
-                  <div key={source.dataSourceId} className="rounded-lg border bg-card/50 overflow-visible">
-                    <div className="p-1.5 space-y-1">
+                  <div
+                    key={source.dataSourceId}
+                    className="rounded-lg border border-border/60 bg-card/80 shadow-sm overflow-visible"
+                  >
+                    {/* 第一行：展开箭头 + 名称（可截断）+ 固定宽度操作菜单 */}
+                    <div className="flex w-full items-center gap-1 p-2">
                       <button
                         type="button"
                         onClick={() => toggleSource(source.dataSourceId)}
-                        className="flex w-full min-w-0 items-center gap-2 p-1 text-left hover:bg-accent/50 rounded-md transition-colors"
+                        className="flex shrink-0 items-center justify-center h-8 w-8 rounded-md hover:bg-accent/60 transition-colors"
+                        title={expanded ? "收起对话列表" : "展开对话列表"}
+                        aria-label={expanded ? "收起对话列表" : "展开对话列表"}
                       >
                         {expanded ? (
-                          <ChevronDown className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+                          <ChevronDown className="w-4 h-4 text-muted-foreground" />
                         ) : (
-                          <ChevronRight className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+                          <ChevronRight className="w-4 h-4 text-muted-foreground" />
                         )}
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs font-medium truncate">{source.name}</p>
-                          <p className="text-[10px] text-muted-foreground truncate">{sourceSubtitle(source)}</p>
-                        </div>
                       </button>
-                      <div className="flex items-center justify-between gap-2 pl-5 pr-0.5">
-                        <span className="text-[10px] text-muted-foreground tabular-nums">
-                          {sessions.length} 个对话
-                        </span>
-                        <div className="flex items-center gap-0.5">
-                          {onEditDataSource && source.dbDatabase && (
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              className="h-7 w-7 shrink-0"
-                              title="编辑数据源"
-                              onClick={() => onEditDataSource(source.dataSourceId)}
-                            >
-                              <Pencil className="w-3.5 h-3.5" />
-                            </Button>
-                          )}
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 shrink-0"
-                            title="新建对话"
-                            onClick={() => onNewConversation(source.dataSourceId)}
-                          >
-                            <MessageCircle className="w-3.5 h-3.5" />
-                          </Button>
-                        </div>
+                      <button
+                        type="button"
+                        onClick={() => toggleSource(source.dataSourceId)}
+                        className="min-w-0 flex-1 overflow-hidden text-left py-0.5 pr-1 rounded-md hover:bg-accent/30 transition-colors"
+                      >
+                        <p className="text-xs font-medium truncate text-foreground">{source.name}</p>
+                        <p className="text-[10px] text-muted-foreground truncate">
+                          {sourceSubtitle(source, sessions.length)}
+                        </p>
+                      </button>
+                      <div className="shrink-0 rounded-md bg-muted/40 p-0.5">
+                        <DataSourceActions
+                          onEdit={
+                            onEditDataSource
+                              ? () => onEditDataSource(source.dataSourceId)
+                              : undefined
+                          }
+                          onNewConversation={() => onNewConversation(source.dataSourceId)}
+                          onDelete={
+                            onDeleteDataSource
+                              ? () => setPendingDeleteSourceId(source.dataSourceId)
+                              : undefined
+                          }
+                        />
                       </div>
                     </div>
                     {expanded && sessions.length > 0 && (
-                      <div className="px-2 pb-2 space-y-0.5">
+                      <div className="px-2 pb-2 pt-0.5 space-y-1 border-t border-border/40">
                         {sessions.map((session) => (
                           <SessionItem
                             key={session.sessionId}
@@ -252,27 +349,34 @@ export function Sidebar({
                         ))}
                       </div>
                     )}
+                    {expanded && sessions.length === 0 && (
+                      <p className="px-3 pb-2 text-[10px] text-muted-foreground/80 border-t border-border/40 pt-2">
+                        暂无对话，点击 ⋯ 新建
+                      </p>
+                    )}
                   </div>
                 );
               })}
             </div>
           )}
-        </ScrollArea>
+        </div>
 
-        <div className="p-4 border-t space-y-2">
+        <div className="p-4 border-t space-y-2 shrink-0">
           <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
             <Clock className="w-3 h-3" />
             最近会话
           </h3>
           {sessionList.length === 0 ? (
-            <p className="text-xs text-muted-foreground py-2 text-center">暂无历史对话</p>
+            <div className="py-4 text-center rounded-lg border border-dashed bg-muted/15">
+              <p className="text-xs text-muted-foreground">暂无历史对话</p>
+            </div>
           ) : (
             <>
               <Select
                 value={currentSessionId || undefined}
                 onValueChange={(id) => onSelectSession(id)}
               >
-                <SelectTrigger className="w-full h-8 text-xs bg-card/60 border-primary/20">
+                <SelectTrigger className="w-full h-9 text-xs bg-card/60 border-primary/20">
                   <SelectValue placeholder="选择历史会话…" />
                 </SelectTrigger>
                 <SelectContent className="max-h-56">
@@ -288,19 +392,17 @@ export function Sidebar({
                   ))}
                 </SelectContent>
               </Select>
-              <ScrollArea className="max-h-36">
-                <div className="space-y-0.5">
-                  {sessionList.slice(0, 8).map((session) => (
-                    <SessionItem
-                      key={session.sessionId}
-                      session={session}
-                      isActive={session.sessionId === currentSessionId}
-                      onSelect={() => onSelectSession(session.sessionId)}
-                      onDelete={() => setPendingDeleteId(session.sessionId)}
-                    />
-                  ))}
-                </div>
-              </ScrollArea>
+              <div className="max-h-36 overflow-y-auto space-y-1 pr-0.5">
+                {sessionList.slice(0, 8).map((session) => (
+                  <SessionItem
+                    key={session.sessionId}
+                    session={session}
+                    isActive={session.sessionId === currentSessionId}
+                    onSelect={() => onSelectSession(session.sessionId)}
+                    onDelete={() => setPendingDeleteId(session.sessionId)}
+                  />
+                ))}
+              </div>
             </>
           )}
         </div>
@@ -322,6 +424,34 @@ export function Sidebar({
                 if (pendingDeleteId) {
                   onDeleteSession(pendingDeleteId);
                   setPendingDeleteId(null);
+                }
+              }}
+            >
+              删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={!!pendingDeleteSourceId}
+        onOpenChange={(open) => !open && setPendingDeleteSourceId(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除此数据源？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将从侧栏隐藏「{pendingSource?.name ?? "该数据源"}」。已有清洗对话不会被删除，仍可在「最近会话」中打开。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (pendingDeleteSourceId && onDeleteDataSource) {
+                  onDeleteDataSource(pendingDeleteSourceId);
+                  setPendingDeleteSourceId(null);
                 }
               }}
             >

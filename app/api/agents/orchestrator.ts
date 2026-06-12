@@ -10,6 +10,11 @@ import {
   type PhaseAction,
 } from "../services/phaseValidator";
 import { buildArtifactBundle } from "../services/artifactService";
+import {
+  persistExploration,
+  persistAnalysis,
+  loadLatestExploration,
+} from "../services/explorationPersistenceService";
 import { runSchemaAgent } from "./schemaAgent";
 import { runQualityAgent } from "./qualityAgent";
 import { runRepairAgent } from "./repairAgent";
@@ -117,14 +122,26 @@ export const SCRIPT_ONLY_PIPELINE: OrchestratorState[] = [
   "done",
 ];
 
+/** 持久化前精简 context：大对象已写入会话表，避免 JSON 重复 */
+function slimOrchestratorContext(ctx: OrchestratorContext): OrchestratorContext {
+  const slim = { ...ctx };
+  if (slim.explorationRef) delete slim.exploration;
+  if (slim.qualityReportRef) {
+    delete slim.qualityReport;
+    delete slim.rules;
+  }
+  return slim;
+}
+
 /** 将上下文序列化写入 DB */
 async function persistRun(runId: string, _sessionId: string, ctx: OrchestratorContext): Promise<void> {
   const db = getDb();
+  const slimCtx = slimOrchestratorContext(ctx);
   await db
     .update(orchestrationRuns)
     .set({
-      state: ctx.state,
-      context: ctx as unknown as Record<string, unknown>,
+      state: slimCtx.state,
+      context: slimCtx as unknown as Record<string, unknown>,
       updatedAt: new Date(),
     })
     .where(eq(orchestrationRuns.runId, runId));
@@ -175,6 +192,7 @@ async function invokeAgentHandler(
       if (!session.dataSource) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, "未连接数据源"] };
       }
+      const isFile = !!session.dataSource.fileConfig;
       const result = await runSchemaAgent({
         sessionId: ctx.input.sessionId,
         dataSource: session.dataSource,
@@ -184,14 +202,23 @@ async function invokeAgentHandler(
       if (!result.success || !result.data) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, result.error ?? "探查失败"] };
       }
+
+      await persistExploration(ctx.input.sessionId, result.data.exploration, {
+        tableName: isFile ? undefined : tableName,
+        lastAction: isFile ? "file_explored" : "db_explored",
+        sessionTitle: `${tableName} · 探查完成`,
+      });
+
       return {
         ...ctx,
         exploration: result.data.exploration,
-        input: { ...ctx.input, tableName, exploration: result.data.exploration },
+        explorationRef: true,
+        input: { ...ctx.input, tableName },
       };
     }
     case "quality_analyze": {
-      const exploration = ctx.exploration ?? session.explorationResult;
+      const exploration =
+        ctx.exploration ?? session.explorationResult ?? (await loadLatestExploration(ctx.input.sessionId));
       if (!exploration) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, "缺少探查结果"] };
       }
@@ -202,10 +229,19 @@ async function invokeAgentHandler(
       if (!result.success || !result.data) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, result.error ?? "质量分析失败"] };
       }
+
+      await persistAnalysis(ctx.input.sessionId, result.data.report, result.data.rules, {
+        phase: "before",
+      });
+
       return {
         ...ctx,
         qualityReport: result.data.report,
         rules: result.data.rules,
+        qualityReportRef: true,
+        explorationRef: true,
+        exploration: undefined,
+        input: { ...ctx.input, tableName },
       };
     }
     case "repair_generate": {

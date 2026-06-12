@@ -2,12 +2,18 @@ import { useState } from "react";
 import { createPortal } from "react-dom";
 import { useCleaningSession } from "@/hooks/useCleaningSession";
 import { trpc } from "@/providers/trpc";
-import type { ChatMessageAction, CleaningPhase } from "@contracts/types";
+import type { ChatMessage, ChatMessageAction, CleaningPhase } from "@contracts/types";
 import { Sidebar } from "@/components/Sidebar";
 import { DataSourceEditDialog } from "@/components/datasource/DataSourceEditDialog";
 import { NewDataSourceDialog } from "@/components/datasource/NewDataSourceDialog";
 import { NewConversationDialog } from "@/components/datasource/NewConversationDialog";
 import { PhaseIndicator } from "@/components/PhaseIndicator";
+import { PipelineRunSwitcher } from "@/components/PipelineRunSwitcher";
+import {
+  RunDiffBanner,
+  ReadOnlyRunBanner,
+  ReadOnlyRevisionBanner,
+} from "@/components/RunDiffBanner";
 import { OrchestratorProgress } from "@/components/OrchestratorProgress";
 import { ExecutionPanel } from "@/components/execute/ExecutionPanel";
 import { RetryPanel } from "@/components/retry/RetryPanel";
@@ -15,6 +21,11 @@ import { ChatPanel } from "@/components/ChatPanel";
 import { SessionDialogs, type SessionDialogType } from "@/components/SessionDialogs";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Menu, ArrowRight, Sparkles } from "lucide-react";
+import { toast } from "sonner";
+import {
+  targetRunIndexForViewAction,
+  targetRevisionIndexForViewAction,
+} from "@/lib/chatActionRun";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 
@@ -30,6 +41,10 @@ export default function Home() {
   const [newConversationSourceId, setNewConversationSourceId] = useState<string | null>(null);
   const [orchestratorRunId, setOrchestratorRunId] = useState<string | undefined>();
   const [orchestratorState, setOrchestratorState] = useState<string | undefined>();
+  /** 从顶部「重试」进入选表流程时，选表面板显示「重新探查」 */
+  const [reExploreFromRetry, setReExploreFromRetry] = useState(false);
+
+  const RETRY_TOAST = "已开始新一轮清洗，历史结果已保留，可通过运行版本切换对比";
 
   const { data: orchestratorRuns } = trpc.orchestrator.listBySession.useQuery(
     { sessionId: session.sessionId! },
@@ -64,36 +79,93 @@ export default function Home() {
     }
   };
 
+  /** 顶部「重试」：在当前会话内重置流程，保留已绑定表/文件 */
   const handleRetryRestart = () => {
-    void session.restartFromTableSelection().then((ok) => {
-      if (ok) setOpenDialog("selectTable");
+    void session.retryInPlace().then((ok) => {
+      if (!ok) return;
+      toast.success(RETRY_TOAST);
+      setReExploreFromRetry(true);
     });
   };
 
-  const handleChatAction = (action: ChatMessageAction) => {
+  const openTableSelectDialog = async () => {
+    const outcome = await session.requestOpenTableSelect();
+    if (outcome === "file") {
+      toast.info("文件数据源无需选表，请直接点击「开始探查」");
+      return;
+    }
+    if (outcome === "new_session") {
+      toast.info("当前会话已绑定数据表，已为您创建新会话");
+    }
+    setOpenDialog("selectTable");
+  };
+
+  const handleSelectTable = async (table: string) => {
+    const result = await session.selectSessionTargetTable(table);
+    if (result === "needs_new_session") {
+      toast.info("当前会话已绑定其他数据表，将为您创建新会话");
+      const created = await session.retryWithNewSession();
+      if (created) {
+        await session.selectSessionTargetTable(table);
+        if (!created.isFileSource) {
+          setOpenDialog("selectTable");
+        }
+      }
+    }
+  };
+
+  const handleChatAction = async (action: ChatMessageAction, message?: ChatMessage) => {
+    const switchToRun = targetRunIndexForViewAction(action, session.viewingRunIndex, message);
+    if (switchToRun != null) {
+      const ok = await session.switchPipelineRun(switchToRun);
+      if (!ok) {
+        toast.error("无法加载该次运行的数据");
+        return;
+      }
+    }
+
+    const effectiveRunIndex = action.runIndex ?? session.viewingRunIndex;
+    const switchToRevision = targetRevisionIndexForViewAction(
+      action,
+      session.viewingRevisionIndex,
+      session.latestRevisionIndex,
+      message
+    );
+    if (switchToRevision != null) {
+      const ok = await session.switchPipelineRevision(switchToRevision, effectiveRunIndex);
+      if (!ok) {
+        toast.error("无法加载该里程碑的规则/SQL 快照");
+        return;
+      }
+    }
+
     switch (action.type) {
       case "selectTable":
-        setOpenDialog("selectTable");
+        setReExploreFromRetry(false);
+        void openTableSelectDialog();
         break;
       case "startExplore":
-        session.startExploration();
+        void session.runAutoExploreAndAnalyze(session.targetTable || undefined).then((result) => {
+          if (result) setReExploreFromRetry(false);
+        });
         break;
       case "runFullPipeline":
+        if (action.id === "run-full-pipeline-db") {
+          void session.runBatchDatabasePipeline();
+          break;
+        }
         if (session.dataSource && !session.dataSource.fileConfig && !session.targetTable) {
-          setOpenDialog("selectTable");
+          void openTableSelectDialog();
         } else {
-          void session.runFullPipelineToSQL(session.targetTable || undefined).then((ok) => {
-            if (ok) setOpenDialog("sql");
-          });
+          void session.runPipelineToGenerateSQL(session.targetTable || undefined);
         }
         break;
       case "runAgentPlan":
-        // 已废弃：多步编排统一走 orchestrator + runFullPipeline
         if (session.dataSource && !session.dataSource.fileConfig && !session.targetTable) {
-          setOpenDialog("selectTable");
+          void openTableSelectDialog();
         } else {
-          void session.runFullPipelineToSQL(session.targetTable || undefined).then((ok) => {
-            if (ok) setOpenDialog("rules");
+          void session.runAutoExploreAndAnalyze(session.targetTable || undefined).then((result) => {
+            if (result) setReExploreFromRetry(false);
           });
         }
         break;
@@ -137,7 +209,7 @@ export default function Home() {
   };
 
   const handleAutoChatAction = (action: ChatMessageAction) => {
-    handleChatAction(action);
+    void handleChatAction(action);
   };
 
   const handleSendMessage = async (content: string) => {
@@ -213,11 +285,16 @@ export default function Home() {
         sessionId={session.sessionId}
         dataSource={session.dataSource}
         targetTable={session.targetTable}
-        onSelectTable={session.setTargetTable}
-        onExplore={(table) => session.startExploration(table)}
+        onSelectTable={(table) => void handleSelectTable(table)}
+        tableExploreButtonLabel={
+          reExploreFromRetry || session.currentPhase === "retry" ? "重新探查" : "开始探查"
+        }
+        onExplore={async (table) => {
+          const result = await session.runAutoExploreAndAnalyze(table);
+          if (result) setReExploreFromRetry(false);
+        }}
         onRunFullPipeline={async (table) => {
-          const ok = await session.runFullPipelineToSQL(table);
-          if (ok) setOpenDialog("sql");
+          await session.runPipelineToGenerateSQL(table);
         }}
         explorationResult={session.explorationResult}
         qualityReport={session.qualityReport}
@@ -240,6 +317,8 @@ export default function Home() {
         onImportContract={(source, format) => session.importContract(source, format)}
         isLoading={session.isLoading}
         isPipelineRunning={session.isPipelineRunning}
+        readOnly={session.isViewingHistoricalSnapshot}
+        runDiff={session.pipelineRunDiff}
       />
     </>
   );
@@ -297,6 +376,7 @@ export default function Home() {
           <div className="p-6 lg:p-8 max-w-3xl mx-auto">
             <ExecutionPanel
               result={session.executionResult}
+              executionHistory={session.executionHistory}
               scriptOnly={scriptOnly}
               onExportBundle={() => void session.exportArtifactBundle()}
               onRetry={() => {
@@ -366,12 +446,16 @@ export default function Home() {
             actionContext={{
               currentPhase: session.currentPhase,
               targetTable: session.targetTable,
+              isFileSource,
+              isViewingHistoricalRun: session.isViewingHistoricalSnapshot,
+              isViewingHistoricalRevision: session.isViewingHistoricalRevision,
               explorationResult: session.explorationResult,
               qualityReport: session.qualityReport,
               cleaningRules: session.cleaningRules,
               generatedSQL: session.generatedSQL,
               executionResult: session.executionResult,
             }}
+            readOnly={session.isViewingHistoricalSnapshot}
           />
         </div>
       </div>
@@ -381,7 +465,7 @@ export default function Home() {
   return (
     <div className="flex h-screen w-screen bg-gradient-to-br from-background via-background to-sky-50/30 dark:to-sky-950/10 overflow-hidden">
       <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen}>
-        <SheetContent side="left" className="w-80 p-0">
+        <SheetContent side="left" className="w-[22rem] min-w-[20rem] p-0">
           <Sidebar
             currentSessionId={session.sessionId}
             sessionList={session.sessionList}
@@ -399,6 +483,7 @@ export default function Home() {
               await session.deleteSessionById(sid);
             }}
             onEditDataSource={setEditingDataSourceId}
+            onDeleteDataSource={(sourceId) => session.deleteDataSourceById(sourceId)}
             onGoHome={() => {
               session.resetSessionState();
               setSidebarOpen(false);
@@ -407,7 +492,7 @@ export default function Home() {
         </SheetContent>
       </Sheet>
 
-      <div className="hidden md:flex w-80 flex-col border-r bg-card shrink-0">
+      <div className="hidden md:flex w-[22rem] min-w-[20rem] flex-col border-r bg-card shrink-0">
         <Sidebar
           currentSessionId={session.sessionId}
           sessionList={session.sessionList}
@@ -417,6 +502,7 @@ export default function Home() {
           onNewConversation={openNewConversation}
           onDeleteSession={(sid) => session.deleteSessionById(sid)}
           onEditDataSource={setEditingDataSourceId}
+          onDeleteDataSource={(sourceId) => session.deleteDataSourceById(sourceId)}
           onGoHome={() => session.resetSessionState()}
         />
       </div>
@@ -450,6 +536,15 @@ export default function Home() {
               onPhaseClick={session.sessionId ? handlePhaseClick : undefined}
               onRetryClick={session.sessionId ? handleRetryRestart : undefined}
             />
+            {session.sessionId && session.pipelineRuns.length > 1 && (
+              <PipelineRunSwitcher
+                runs={session.pipelineRuns}
+                currentRunIndex={session.currentRunIndex}
+                viewingRunIndex={session.viewingRunIndex}
+                onSwitch={(runIndex) => void session.switchPipelineRun(runIndex)}
+                disabled={session.isLoading}
+              />
+            )}
             {session.sessionId && (
               <OrchestratorProgress
                 runId={displayRunId}
@@ -457,6 +552,28 @@ export default function Home() {
               />
             )}
           </div>
+          {(session.isViewingHistoricalSnapshot ||
+            session.pipelineRunDiff?.hasBaseline) && (
+            <div className="px-4 pb-2 space-y-2 shrink-0">
+              {session.isViewingHistoricalRun && (
+                <ReadOnlyRunBanner
+                  viewingRunIndex={session.viewingRunIndex}
+                  currentRunIndex={session.currentRunIndex}
+                  onSwitchToCurrent={() => void session.switchPipelineRun(session.currentRunIndex)}
+                />
+              )}
+              {session.isViewingHistoricalRevision && (
+                <ReadOnlyRevisionBanner
+                  viewingRevisionIndex={session.viewingRevisionIndex!}
+                  latestRevisionIndex={session.latestRevisionIndex}
+                  onSwitchToLatest={() =>
+                    void session.switchToLiveRevision(session.viewingRunIndex)
+                  }
+                />
+              )}
+              <RunDiffBanner diff={session.pipelineRunDiff} />
+            </div>
+          )}
         </header>
 
         <div className="flex flex-1 min-h-0 overflow-hidden">

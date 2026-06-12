@@ -11,6 +11,7 @@ export type RuleQualityCategory =
   | "validity"
   | "text"
   | "document"
+  | "filter"
   | "skeleton"
   | "metrics";
 
@@ -22,6 +23,7 @@ export const RULE_QUALITY_CATEGORY_LABELS: Record<RuleQualityCategory, string> =
   validity: "有效性",
   text: "文本",
   document: "文档",
+  filter: "过滤",
   skeleton: "骨架",
   metrics: "质量指标",
 };
@@ -133,6 +135,28 @@ export const CLEANING_ACTION_REGISTRY: Record<CleaningAction, CleaningActionDefi
   },
 };
 
+/** 支持 invalidAction 配置的 parameters.type 子类型 */
+export const INVALID_ACTION_RULE_TYPES = new Set([
+  "email_validate",
+  "phone_validate",
+  "regex_validate",
+  "length_validate",
+  "length_range",
+  "range_validate",
+  "id_card_transform",
+  "decimal_precision",
+  "integer_validate",
+  "credit_code_validate",
+  "landline_validate",
+  "mac_validate",
+  "ip_validate",
+  "longitude_validate",
+  "latitude_validate",
+]);
+
+/** 支持 unmatchedStrategy 的 dictMap / 码表规则 */
+export const UNMATCHED_STRATEGY_RULE_TYPES = new Set(["dictMap", "fk_reference"]);
+
 /** 参数级子规则（挂在 standardize / format / fill_null 的 parameters.type 上） */
 export interface ParameterRuleDefinition {
   type: string;
@@ -216,6 +240,177 @@ export const PARAMETER_RULE_REGISTRY: Record<string, ParameterRuleDefinition> = 
     analysisDetector: false,
     recommended: false,
   },
+  // --- planned: true — 对齐 stub，见 docs/CLEANING_RULES_REDESIGN.md P0/P1 ---
+  id_card_transform: {
+    type: "id_card_transform",
+    label: "身份证校验转换",
+    description: "15 位升 18 位、校验位、结尾 x 大写（GB 11643）；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  decimal_precision: {
+    type: "decimal_precision",
+    label: "精度标准化",
+    description: "数值保留指定小数位（scale）；支持 invalidAction",
+    category: "accuracy",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: false,
+    recommended: false,
+  },
+  integer_validate: {
+    type: "integer_validate",
+    label: "整型校验",
+    description: "判断并处理非整型值；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: false,
+    recommended: false,
+  },
+  strip_chars: {
+    type: "strip_chars",
+    label: "去除特定字符",
+    description: "format 分支：去除字母/数字/中文等（charClasses）",
+    category: "text",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: false,
+    recommended: false,
+  },
+  substring: {
+    type: "substring",
+    label: "字符串截取",
+    description: "format 分支：按 start/end 截取",
+    category: "text",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: false,
+    recommended: false,
+  },
+  length_range: {
+    type: "length_range",
+    label: "长度区间过滤",
+    description: "min/max 长度校验或 reject 删行；区别于 length_validate 精确长度",
+    category: "filter",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  compare_filter: {
+    type: "compare_filter",
+    label: "比较过滤",
+    description: "固定值/列比较后删行（eq/ne/gt/lt/gte/lte）；支持 invalidAction=reject",
+    category: "filter",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  regex_filter: {
+    type: "regex_filter",
+    label: "正则过滤",
+    description: "正则不匹配则删行（区别于 regex_validate 单元格转换）",
+    category: "filter",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  domain_filter: {
+    type: "domain_filter",
+    label: "标准值域过滤",
+    description: "枚举/数值域不满足则分流；dataStandardParser 自动生成",
+    category: "filter",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: false,
+    recommended: true,
+  },
+  credit_code_validate: {
+    type: "credit_code_validate",
+    label: "统一社会信用代码校验",
+    description: "18 位信用代码校验位；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  org_code_validate: {
+    type: "org_code_validate",
+    label: "组织机构代码校验",
+    description: "planned: 命名实体规则集（未实现）",
+    category: "validity",
+    sqlSupported: false,
+    fileSupported: false,
+    analysisDetector: false,
+    recommended: false,
+  },
+  landline_validate: {
+    type: "landline_validate",
+    label: "固定电话校验",
+    description: "7-12 位固话；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  longitude_validate: {
+    type: "longitude_validate",
+    label: "经度校验",
+    description: "经度 [-180,180]；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  latitude_validate: {
+    type: "latitude_validate",
+    label: "纬度校验",
+    description: "纬度 [-90,90]；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: true,
+    recommended: true,
+  },
+  mac_validate: {
+    type: "mac_validate",
+    label: "MAC 地址校验",
+    description: "MAC 格式校验；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: false,
+    recommended: false,
+  },
+  ip_validate: {
+    type: "ip_validate",
+    label: "IP 地址校验",
+    description: "IPv4/IPv6 简化校验；支持 invalidAction",
+    category: "validity",
+    sqlSupported: true,
+    fileSupported: true,
+    analysisDetector: false,
+    recommended: false,
+  },
+  custom_expression: {
+    type: "custom_expression",
+    label: "自定义表达式",
+    description: "defer stub：受控 SQL/JS 表达式待 sandbox 实现（P2-R6）",
+    category: "skeleton",
+    sqlSupported: false,
+    fileSupported: false,
+    analysisDetector: false,
+    recommended: false,
+  },
 };
 
 /** 高级算法规则（MICE、Isolation Forest 等）标记为不推荐自动应用 */
@@ -223,6 +418,12 @@ export const ADVANCED_RULE_TYPES = new Set([
   "mice_impute",
   "isolation_forest",
   "dbscan_outlier",
+  "custom_expression",
+]);
+
+/** 对齐规划中、尚未实现 SQL/文件/分析的子类型 */
+export const PLANNED_RULE_TYPES = new Set([
+  "org_code_validate",
 ]);
 
 /** 高级/未启用规则 UI 标签 */

@@ -4,10 +4,9 @@ import { listDatabaseTables, testDatabaseConnection } from "../services/dataSour
 import { getDataSourceById } from "../services/dataSourceStoreService";
 import { resolveDbConfigInput } from "../services/sessionCredentialService";
 import { runSchemaAgent } from "../agents/schemaAgent";
-import { updateSessionPhase, updateSessionTargetTable, updateSessionTitle } from "../services/sessionService";
-import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
-import { getDb } from "../queries/connection";
-import { explorationResults } from "@db/schema";
+import { validatePhaseTransition, PhaseValidationError, HistoricalRunWriteError } from "../services/phaseValidator";
+import { persistExploration } from "../services/explorationPersistenceService";
+import { resolveExistingUploadPath } from "../services/uploadPathService";
 
 const dbConfigSchema = z.object({
   host: z.string(),
@@ -75,6 +74,7 @@ export const exploreRouter = createRouter({
     .input(
       z.object({
         sessionId: z.string(),
+        runIndex: z.number().int().positive().optional(),
         config: z.object({
           host: z.string(),
           port: z.number(),
@@ -90,7 +90,7 @@ export const exploreRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await validatePhaseTransition(input.sessionId, "explore");
+        await validatePhaseTransition(input.sessionId, "explore", input.runIndex);
         const resolvedConfig = await resolveDbConfigInput(input.sessionId, input.config);
         const agentResult = await runSchemaAgent({
           sessionId: input.sessionId,
@@ -111,31 +111,16 @@ export const exploreRouter = createRouter({
         }
         const result = agentResult.data.exploration;
 
-        // Save to DB
-        const db = getDb();
-        await db.insert(explorationResults).values({
-          sessionId: input.sessionId,
-          sourceType: result.sourceType,
-          sourceName: result.sourceName,
-          totalRows: result.totalRows,
-          totalCols: result.totalCols,
-          schema: result.schema,
-          sampleData: result.sampleData,
-          columnStats: result.columnStats,
-          issues: result.issues,
+        await persistExploration(input.sessionId, result, {
+          tableName: input.tableName,
+          lastAction: "db_explored",
+          sessionTitle: `${input.tableName} · 探查完成`,
         });
-
-        await updateSessionPhase(input.sessionId, "explore", "db_explored");
-        await updateSessionTargetTable(input.sessionId, input.tableName);
-        await updateSessionTitle(
-          input.sessionId,
-          `${input.tableName} · 探查完成`
-        );
 
         return { success: true, result };
       } catch (error) {
         const message =
-          error instanceof PhaseValidationError
+          error instanceof PhaseValidationError || error instanceof HistoricalRunWriteError
             ? error.message
             : error instanceof Error
             ? error.message
@@ -148,6 +133,7 @@ export const exploreRouter = createRouter({
     .input(
       z.object({
         sessionId: z.string(),
+        runIndex: z.number().int().positive().optional(),
         filePath: z.string(),
         fileType: z.enum(["csv", "json", "xml", "xlsx"]),
         previewRows: z.number().optional().default(100),
@@ -155,21 +141,22 @@ export const exploreRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await validatePhaseTransition(input.sessionId, "explore");
-        const fileName = input.filePath.split("/").pop() ?? "file";
+        await validatePhaseTransition(input.sessionId, "explore", input.runIndex);
+        const resolvedPath = resolveExistingUploadPath(input.filePath);
+        const fileName = resolvedPath.split("/").pop() ?? "file";
         const agentResult = await runSchemaAgent({
           sessionId: input.sessionId,
           dataSource: {
             type: input.fileType,
             name: fileName,
             fileConfig: {
-              filePath: input.filePath,
+              filePath: resolvedPath,
               fileType: input.fileType,
               fileName,
               fileSize: 0,
             },
           },
-          tableName: input.filePath.split("/").pop()?.replace(/\.[^.]+$/, "") ?? "data",
+          tableName: fileName.replace(/\.[^.]+$/, "") || "data",
           limit: input.previewRows,
         });
         if (!agentResult.success || !agentResult.data) {
@@ -181,26 +168,14 @@ export const exploreRouter = createRouter({
         }
         const result = agentResult.data.exploration;
 
-        // Save to DB
-        const db = getDb();
-        await db.insert(explorationResults).values({
-          sessionId: input.sessionId,
-          sourceType: result.sourceType,
-          sourceName: result.sourceName,
-          totalRows: result.totalRows,
-          totalCols: result.totalCols,
-          schema: result.schema,
-          sampleData: result.sampleData,
-          columnStats: result.columnStats,
-          issues: result.issues,
+        await persistExploration(input.sessionId, result, {
+          lastAction: "file_explored",
         });
-
-        await updateSessionPhase(input.sessionId, "explore", "file_explored");
 
         return { success: true, result };
       } catch (error) {
         const message =
-          error instanceof PhaseValidationError
+          error instanceof PhaseValidationError || error instanceof HistoricalRunWriteError
             ? error.message
             : error instanceof Error
             ? error.message

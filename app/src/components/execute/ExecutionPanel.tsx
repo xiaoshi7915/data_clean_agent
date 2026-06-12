@@ -19,6 +19,8 @@ import type { ExecutionResult } from "@contracts/types";
 
 interface ExecutionPanelProps {
   result: ExecutionResult | null;
+  /** 当前 run 的历史执行记录（最新在前） */
+  executionHistory?: ExecutionResult[];
   onRetry: () => void;
   onExportSQL: () => void;
   /** SCRIPT_ONLY 模式：提示导出脚本包而非真实执行 */
@@ -29,6 +31,7 @@ interface ExecutionPanelProps {
 
 export function ExecutionPanel({
   result,
+  executionHistory = [],
   onRetry,
   onExportSQL,
   scriptOnly = false,
@@ -230,6 +233,52 @@ export function ExecutionPanel({
           </div>
         </CardContent>
       </Card>
+
+      {/* Execution History */}
+      {executionHistory.length > 1 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <Clock className="w-4 h-4 text-muted-foreground" />
+              执行历史（{executionHistory.length} 次）
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2">
+              {executionHistory.map((run) => {
+                const ok = run.stepResults.filter((s) => s.status === "success").length;
+                const fail = run.stepResults.filter((s) => s.status === "failed").length;
+                const totalMs = run.stepResults.reduce((sum, s) => sum + (s.durationMs ?? 0), 0);
+                return (
+                  <div
+                    key={run.executionId}
+                    className="flex items-center justify-between gap-3 p-3 rounded-lg border border-border bg-muted/30 text-sm"
+                  >
+                    <div className="min-w-0">
+                      <p className="font-medium truncate">{run.executionId}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {run.startedAt ? new Date(run.startedAt).toLocaleString() : "-"}
+                        {" · "}
+                        {ok}/{run.stepResults.length} 步成功
+                        {fail > 0 ? ` · ${fail} 失败` : ""}
+                      </p>
+                    </div>
+                    <div className="text-right shrink-0">
+                      <Badge
+                        variant={run.overallStatus === "success" ? "default" : "destructive"}
+                        className={run.overallStatus === "success" ? "bg-emerald-500" : ""}
+                      >
+                        {run.overallStatus}
+                      </Badge>
+                      <p className="text-xs text-muted-foreground mt-1">{totalMs}ms</p>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Quality Comparison */}
       {result.metricsAfter && (

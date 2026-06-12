@@ -1,9 +1,16 @@
 import { useCallback } from "react";
 import { toast } from "sonner";
-import { downloadJsonFile, downloadTextFile } from "@/lib/downloadReport";
+import { downloadJsonFile, downloadTextFile, downloadZipFromBase64 } from "@/lib/downloadReport";
 import type { CleaningRule } from "@contracts/types";
 import type { CleaningSessionState } from "./cleaningSessionState";
 import type { ChatApi } from "./useChat";
+import {
+  historicalRunReadonlyMessage,
+  historicalRevisionReadonlyMessage,
+  isHistoricalRunView,
+  isHistoricalRevisionView,
+  writeRunIndexForMutation,
+} from "./writableRunGuard";
 
 /** 规则确认、自定义规则与契约导入导出 */
 export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
@@ -14,6 +21,11 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
     setCleaningRules,
     setIsLoading,
     setError,
+    viewingRunIndex,
+    currentRunIndex,
+    viewingRevisionIndex,
+    latestRevisionIndex,
+    setViewingRevisionIndex,
     mutations: {
       updateRule,
       confirmAllRules,
@@ -29,12 +41,39 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
   } = state;
 
   const { pushMessage } = chat;
+  const writeRunIndex = writeRunIndexForMutation(viewingRunIndex, currentRunIndex);
+
+  const ensureWritable = useCallback((): boolean => {
+    if (isHistoricalRunView(viewingRunIndex, currentRunIndex)) {
+      const msg = historicalRunReadonlyMessage(viewingRunIndex, currentRunIndex);
+      setError(msg);
+      toast.info(msg);
+      return false;
+    }
+    if (isHistoricalRevisionView(viewingRevisionIndex, latestRevisionIndex)) {
+      const msg = historicalRevisionReadonlyMessage(
+        viewingRevisionIndex!,
+        latestRevisionIndex
+      );
+      setError(msg);
+      toast.info(msg);
+      return false;
+    }
+    return true;
+  }, [
+    viewingRunIndex,
+    currentRunIndex,
+    viewingRevisionIndex,
+    latestRevisionIndex,
+    setError,
+  ]);
 
   const updateRuleStatus = useCallback(
     async (ruleId: string, status: CleaningRule["status"]) => {
-      if (!sessionId) return;
+      if (!sessionId || !ensureWritable()) return;
       try {
-        await updateRule.mutateAsync({ sessionId, ruleId, status });
+        await updateRule.mutateAsync({ sessionId, ruleId, status, runIndex: writeRunIndex });
+        setViewingRevisionIndex(null);
         setCleaningRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, status } : r)));
       } catch (err) {
         console.error("Failed to update rule:", err);
@@ -45,7 +84,7 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
 
   const updateRuleParameters = useCallback(
     async (ruleId: string, parameters: Record<string, unknown>) => {
-      if (!sessionId) return;
+      if (!sessionId || !ensureWritable()) return;
       try {
         const current = cleaningRules.find((r) => r.id === ruleId);
         const mergedParams = { ...current?.parameters, ...parameters };
@@ -63,6 +102,7 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
 
         await updateRuleParams.mutateAsync({
           sessionId,
+          runIndex: writeRunIndex,
           ruleId,
           parameters: mergedParams,
           action: selected?.action,
@@ -107,10 +147,11 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
       parameters?: Record<string, unknown>;
       riskLevel?: "high" | "medium" | "low";
     }) => {
-      if (!sessionId) return false;
+      if (!sessionId || !ensureWritable()) return false;
       try {
         const result = await createCustomRuleMut.mutateAsync({
           sessionId,
+          runIndex: writeRunIndex,
           ...input,
         });
         if (result.success && result.rule) {
@@ -129,9 +170,13 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
 
   const deleteCustomRule = useCallback(
     async (ruleId: string) => {
-      if (!sessionId) return false;
+      if (!sessionId || !ensureWritable()) return false;
       try {
-        const result = await deleteCustomRuleMut.mutateAsync({ sessionId, ruleId });
+        const result = await deleteCustomRuleMut.mutateAsync({
+          sessionId,
+          ruleId,
+          runIndex: writeRunIndex,
+        });
         if (result.success) {
           setCleaningRules((prev) => prev.filter((r) => r.id !== ruleId));
           return true;
@@ -147,10 +192,10 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
   );
 
   const confirmAll = useCallback(async () => {
-    if (!sessionId) return;
+    if (!sessionId || !ensureWritable()) return;
     setIsLoading(true);
     try {
-      await confirmAllRules.mutateAsync({ sessionId });
+      await confirmAllRules.mutateAsync({ sessionId, runIndex: writeRunIndex });
       setCleaningRules((prev) =>
         prev.map((r) =>
           r.status === "pending" || r.status === "confirmed"
@@ -272,16 +317,14 @@ export function useRuleContract(state: CleaningSessionState, chat: ChatApi) {
       return false;
     }
     try {
-      const result = await exportBundleMut.mutateAsync({ sessionId });
-      if (!result.success || !result.files) {
+      const result = await exportBundleMut.mutateAsync({ sessionId, asZip: true });
+      if (!result.success || !result.zipBase64) {
         toast.error(result.error || "导出脚本包失败");
         return false;
       }
-      downloadJsonFile(
-        { manifest: result.manifest, files: result.files },
-        `cleaning-bundle-${sessionId}.json`
-      );
-      toast.success(`脚本包已导出（${result.files.length} 个文件）`);
+      downloadZipFromBase64(result.zipBase64, `cleaning-bundle-${sessionId}.zip`);
+      const fileCount = result.files?.length ?? 0;
+      toast.success(`脚本包已导出（${fileCount} 个文件，已打包为 zip）`);
       return true;
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "导出脚本包失败");

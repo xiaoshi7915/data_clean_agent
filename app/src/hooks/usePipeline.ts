@@ -1,11 +1,20 @@
 import { useCallback } from "react";
+import { isDbSourceType } from "./cleaningSessionState";
 import { toast } from "sonner";
-import { downloadJsonFile } from "@/lib/downloadReport";
+import { downloadZipFromBase64 } from "@/lib/downloadReport";
 import { trpc } from "@/providers/trpc";
 import type { CleaningSessionState } from "./cleaningSessionState";
 import type { ChatApi } from "./useChat";
 import { usePipelineRetry } from "./usePipelineRetry";
 import { resolveDialect, runExploration, cleanedOutputHint, exploreCompleteMessage } from "./pipelineHelpers";
+import { VIEW_PIPELINE_WITH_SQL_ACTIONS } from "@/lib/pipelineMessageActions";
+import {
+  historicalRunReadonlyMessage,
+  historicalRevisionReadonlyMessage,
+  isHistoricalRunView,
+  isHistoricalRevisionView,
+  writeRunIndexForMutation,
+} from "./writableRunGuard";
 
 /** 与 agentService.AgentPlanStep 对齐的前端步骤类型 */
 export type AgentPlanStep =
@@ -39,6 +48,10 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
     setIsLoading,
     setIsPipelineRunning,
     setError,
+    viewingRunIndex,
+    currentRunIndex,
+    viewingRevisionIndex,
+    latestRevisionIndex,
     mutations: {
       exploreDb,
       exploreFile,
@@ -50,9 +63,11 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
       modifySqlStepMut,
       confirmAllRules,
       exportBundleMut,
+      batchDatabaseMut,
     },
     syncPhase,
     refreshLists,
+    utils,
   } = state;
 
   const { pushMessage } = chat;
@@ -60,11 +75,56 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
   const { data: runtimeConfig } = trpc.artifact.config.useQuery();
   const scriptOnly = runtimeConfig?.scriptOnly ?? true;
 
+  const ensureWritable = useCallback((): boolean => {
+    if (isHistoricalRunView(viewingRunIndex, currentRunIndex)) {
+      const msg = historicalRunReadonlyMessage(viewingRunIndex, currentRunIndex);
+      setError(msg);
+      toast.info(msg);
+      return false;
+    }
+    if (isHistoricalRevisionView(viewingRevisionIndex, latestRevisionIndex)) {
+      const msg = historicalRevisionReadonlyMessage(
+        viewingRevisionIndex!,
+        latestRevisionIndex
+      );
+      setError(msg);
+      toast.info(msg);
+      return false;
+    }
+    return true;
+  }, [
+    viewingRunIndex,
+    currentRunIndex,
+    viewingRevisionIndex,
+    latestRevisionIndex,
+    setError,
+  ]);
+
+  const writeRunIndex = writeRunIndexForMutation(viewingRunIndex, currentRunIndex);
+
+  /** 生成 SQL 前从 DB 拉取最新规则，避免 NL 改规则后内存态过期 */
+  const refreshRulesFromDb = useCallback(async () => {
+    if (!sessionId) return cleaningRules;
+    try {
+      const full = await utils.session.getFull.fetch({
+        sessionId,
+        runIndex: writeRunIndex,
+      });
+      if (full.found && full.session?.cleaningRules?.length) {
+        setCleaningRules(full.session.cleaningRules);
+        return full.session.cleaningRules;
+      }
+    } catch (err) {
+      console.error("Failed to refresh rules before SQL generation:", err);
+    }
+    return cleaningRules;
+  }, [sessionId, cleaningRules, writeRunIndex, utils.session.getFull, setCleaningRules]);
+
   const modifySQLStep = useCallback(
     async (stepNumber: number, newSql: string) => {
-      if (!sessionId || !generatedSQL) return;
+      if (!sessionId || !generatedSQL || !ensureWritable()) return;
       try {
-        await modifySqlStepMut.mutateAsync({ sessionId, stepNumber, newSql });
+        await modifySqlStepMut.mutateAsync({ sessionId, stepNumber, newSql, runIndex: writeRunIndex });
         setGeneratedSQL((prev) =>
           prev
             ? {
@@ -79,12 +139,12 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
         setError(err instanceof Error ? err.message : "保存 SQL 修改失败");
       }
     },
-    [sessionId, generatedSQL, modifySqlStepMut, setGeneratedSQL, setError]
+    [sessionId, generatedSQL, modifySqlStepMut, setGeneratedSQL, setError, ensureWritable, writeRunIndex]
   );
 
   const startExploration = useCallback(
     async (tableName?: string) => {
-      if (!dataSource || !sessionId) return;
+      if (!dataSource || !sessionId || !ensureWritable()) return;
       setIsLoading(true);
       setError(null);
       await syncPhase(sessionId, "explore");
@@ -94,7 +154,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
           sessionId,
           dataSource,
           tableName ?? targetTable,
-          { exploreDb, exploreFile }
+          { exploreDb, exploreFile },
+          writeRunIndex
         );
         setTargetTable(resolvedTable);
         setExplorationResult(exploration);
@@ -130,13 +191,17 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
   );
 
   const startAnalysis = useCallback(async () => {
-    if (!explorationResult || !sessionId) return;
+    if (!explorationResult || !sessionId || !ensureWritable()) return;
     setIsLoading(true);
     setError(null);
     await syncPhase(sessionId, "analyze");
 
     try {
-      const result = await analyze.mutateAsync({ sessionId, explorationResult });
+      const result = await analyze.mutateAsync({
+        sessionId,
+        runIndex: writeRunIndex,
+        explorationResult,
+      });
 
       if (result.success && result.report) {
         setQualityReport(result.report);
@@ -183,23 +248,13 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
   ]);
 
   const generateCleaningSQL = useCallback(async () => {
-    if (!sessionId || !dataSource) return;
-    const confirmedRules = cleaningRules.filter((r) => r.status === "confirmed");
-    if (confirmedRules.length === 0 && cleaningRules.length > 0) {
-      pushMessage(
-        sessionId,
-        "agent",
-        "⚠️ 请先在「查看清洗规则」中确认至少一条规则，再生成 SQL。",
-        "confirm",
-        [{ id: "view-rules", label: "查看清洗规则", type: "viewRules" }]
-      );
-      return;
-    }
+    if (!sessionId || !dataSource || !ensureWritable()) return;
     setIsLoading(true);
     setError(null);
     await syncPhase(sessionId, "generate");
 
     try {
+      const freshRules = await refreshRulesFromDb();
       const dialect = resolveDialect(dataSource.type);
       const tableName =
         targetTable || dataSource.fileConfig?.fileName.replace(/\.[^.]+$/, "") || "data";
@@ -207,7 +262,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
 
       const result = await generateSQL.mutateAsync({
         sessionId,
-        rules: cleaningRules,
+        runIndex: writeRunIndex,
+        rules: freshRules,
         dialect,
         tableName,
         databaseName,
@@ -219,12 +275,17 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
         const fileHint = dataSource.fileConfig
           ? `输出文件：${cleanedOutputHint(dataSource)}`
           : `目标表：${result.result.targetTable}`;
+        const confirmedCount = freshRules.filter((r) => r.status === "confirmed").length;
+        const summaryMessage =
+          confirmedCount === 0
+            ? `📝 未检测到需清洗规则，已生成原表复制 SQL。共 ${result.result.steps.length} 个步骤。${fileHint}`
+            : `📝 清洗方案生成完成！共 ${result.result.steps.length} 个步骤。${fileHint}`;
         pushMessage(
           sessionId,
           "agent",
-          `📝 清洗方案生成完成！共 ${result.result.steps.length} 个步骤。${fileHint}`,
+          summaryMessage,
           "generate",
-          [{ id: "view-sql", label: "查看清洗SQL", type: "viewSQL" }]
+          VIEW_PIPELINE_WITH_SQL_ACTIONS
         );
         await refreshLists();
       } else {
@@ -245,14 +306,17 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
     pushMessage,
     syncPhase,
     refreshLists,
+    refreshRulesFromDb,
     setGeneratedSQL,
     setIsLoading,
     setError,
   ]);
 
-  const runFullPipelineToSQL = useCallback(
-    async (tableName?: string): Promise<boolean> => {
-      if (!dataSource || !sessionId) return false;
+  const runAutoExploreAndAnalyze = useCallback(
+    async (
+      tableName?: string
+    ): Promise<{ exploration: typeof explorationResult; report: typeof qualityReport } | null> => {
+      if (!dataSource || !sessionId || !ensureWritable()) return null;
 
       setIsPipelineRunning(true);
       setIsLoading(true);
@@ -264,56 +328,170 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
           sessionId,
           dataSource,
           tableName ?? targetTable,
-          { exploreDb, exploreFile }
+          { exploreDb, exploreFile },
+          writeRunIndex
         );
         setTargetTable(resolvedTable);
         setExplorationResult(exploration);
-        setSessionTitle(`${resolvedTable || exploration.sourceName} · 一键生成SQL`);
-        pushMessage(sessionId, "agent", exploreCompleteMessage(exploration), "explore", [
-          { id: "view-explore", label: "查看探查报告", type: "viewExplore" },
-          { id: "start-analysis", label: "进入质量分析", type: "startAnalysis" },
-        ]);
+        setSessionTitle(`${resolvedTable || exploration.sourceName} · 探查分析`);
 
         await syncPhase(sessionId, "analyze");
         const analyzeResult = await analyze.mutateAsync({
           sessionId,
+          runIndex: writeRunIndex,
           explorationResult: exploration,
         });
         if (!analyzeResult.success || !analyzeResult.report) {
           throw new Error(analyzeResult.error || "分析失败");
         }
 
-        const rules = analyzeResult.rules;
+        setQualityReport(analyzeResult.report);
+        setCleaningRules(analyzeResult.rules);
+        await syncPhase(sessionId, "confirm");
+
+        const ruleCount = analyzeResult.rules.length;
+        pushMessage(
+          sessionId,
+          "agent",
+          `🔍 **探查与分析完成！**\n\n表 \`${resolvedTable || exploration.sourceName}\` · ${exploration.totalRows.toLocaleString()} 行 · ${exploration.totalCols} 列\n\n**质量评分：${analyzeResult.report.score.overall}/100**${
+            ruleCount > 0 ? `\n\n已推荐 **${ruleCount}** 条清洗规则。` : "\n\n数据质量良好，暂无清洗建议。"
+          }\n\n点击下方按钮查看报告或规则，不会自动弹出弹窗。`,
+          "confirm",
+          [
+            { id: "view-explore", label: "查看探查报告", type: "viewExplore" },
+            { id: "view-quality", label: "查看质量报告", type: "viewQuality" },
+            { id: "view-rules", label: "查看清洗规则", type: "viewRules" },
+          ]
+        );
+        await refreshLists();
+        return { exploration, report: analyzeResult.report };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        setError(msg);
+        pushMessage(sessionId, "agent", `❌ 自动探查分析失败：${msg}`, "explore");
+        return null;
+      } finally {
+        setIsPipelineRunning(false);
+        setIsLoading(false);
+      }
+    },
+    [
+      sessionId,
+      dataSource,
+      targetTable,
+      exploreDb,
+      exploreFile,
+      analyze,
+      syncPhase,
+      pushMessage,
+      refreshLists,
+      setExplorationResult,
+      setSessionTitle,
+      setTargetTable,
+      setQualityReport,
+      setCleaningRules,
+      setIsPipelineRunning,
+      setIsLoading,
+      setError,
+    ]
+  );
+
+  const runFullPipelineToSQL = useCallback(
+    async (tableName?: string): Promise<boolean> => {
+      const result = await runAutoExploreAndAnalyze(tableName);
+      return result != null;
+    },
+    [runAutoExploreAndAnalyze]
+  );
+
+  /** 一键生成 SQL：探查 → 分析 → 自动确认规则 → 生成 SQL（不执行） */
+  const runPipelineToGenerateSQL = useCallback(
+    async (tableName?: string): Promise<boolean> => {
+      if (!dataSource || !sessionId || !ensureWritable()) return false;
+
+      setIsPipelineRunning(true);
+      setIsLoading(true);
+      setError(null);
+
+      try {
+        await syncPhase(sessionId, "explore");
+        const { exploration, resolvedTable } = await runExploration(
+          sessionId,
+          dataSource,
+          tableName ?? targetTable,
+          { exploreDb, exploreFile },
+          writeRunIndex
+        );
+        setTargetTable(resolvedTable);
+        setExplorationResult(exploration);
+        setSessionTitle(`${resolvedTable || exploration.sourceName} · 一键生成SQL`);
+
+        await syncPhase(sessionId, "analyze");
+        const analyzeResult = await analyze.mutateAsync({
+          sessionId,
+          runIndex: writeRunIndex,
+          explorationResult: exploration,
+        });
+        if (!analyzeResult.success || !analyzeResult.report) {
+          throw new Error(analyzeResult.error || "分析失败");
+        }
+
+        let rules = analyzeResult.rules;
         setQualityReport(analyzeResult.report);
         setCleaningRules(rules);
         await syncPhase(sessionId, "confirm");
 
-        const ruleCount = rules.length;
+        if (rules.length > 0) {
+          await confirmAllRules.mutateAsync({ sessionId, runIndex: writeRunIndex });
+          rules = rules.map((r) =>
+            r.status === "skipped" ? r : { ...r, status: "confirmed" as const }
+          );
+          setCleaningRules(rules);
+        }
+
+        await syncPhase(sessionId, "generate");
+        const dialect = resolveDialect(dataSource.type);
+        const sqlTableName =
+          resolvedTable || dataSource.fileConfig?.fileName.replace(/\.[^.]+$/, "") || "data";
+        const databaseName = dataSource.dbConfig?.database || "default";
+
+        const sqlResult = await generateSQL.mutateAsync({
+          sessionId,
+          runIndex: writeRunIndex,
+          rules,
+          dialect,
+          tableName: sqlTableName,
+          databaseName,
+          columns: exploration.schema.map((c) => c.name),
+        });
+        if (!sqlResult.success || !sqlResult.result) {
+          throw new Error(sqlResult.error || "SQL生成失败");
+        }
+
+        setGeneratedSQL(sqlResult.result);
+        const fileHint = dataSource.fileConfig
+          ? `输出文件：${cleanedOutputHint(dataSource)}`
+          : `目标表：${sqlResult.result.targetTable}`;
+        const confirmedCount = rules.filter((r) => r.status === "confirmed").length;
+        const rulesSummary =
+          confirmedCount === 0
+            ? "\n\n未检测到需清洗规则，已生成原表复制 SQL。"
+            : rules.length > 0
+              ? `\n\n已自动确认 **${confirmedCount}** 条规则并生成清洗方案。`
+              : "\n\n数据质量良好，已直接生成清洗方案。";
         pushMessage(
           sessionId,
           "agent",
-          ruleCount === 0
-            ? `📈 质量分析完成！\n\n**质量评分：${analyzeResult.report.score.overall}/100**\n\n数据质量良好，无需清洗规则。`
-            : `📈 质量分析完成！\n\n**质量评分：${analyzeResult.report.score.overall}/100**\n\n已生成 **${ruleCount}** 条清洗规则，请确认后再生成 SQL。`,
-          "confirm",
-          [
-            { id: "view-quality", label: "查看质量报告", type: "viewQuality" },
-            ...(ruleCount > 0
-              ? [
-                  { id: "view-rules", label: "查看清洗规则", type: "viewRules" as const },
-                  { id: "confirm-all", label: "确认全部规则", type: "confirmAll" as const },
-                ]
-              : []),
-          ]
+          `⚡ **一键生成 SQL** 完成！\n\n**质量评分：${analyzeResult.report.score.overall}/100**${rulesSummary}\n\n${fileHint}`,
+          "generate",
+          VIEW_PIPELINE_WITH_SQL_ACTIONS
         );
-
-        // human_confirm 闸门：不自动 confirmAll，等待用户确认
         await refreshLists();
         return true;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
-        pushMessage(sessionId, "agent", `❌ 一键流程失败：${msg}`, "explore");
+        pushMessage(sessionId, "agent", `❌ 一键生成 SQL 失败：${msg}`, "explore");
         return false;
       } finally {
         setIsPipelineRunning(false);
@@ -346,7 +524,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
 
   const executeSQL = useCallback(
     async (dryRun: boolean = false) => {
-      if (!sessionId || !generatedSQL || !dataSource) return;
+      if (!sessionId || !generatedSQL || !dataSource || !ensureWritable()) return;
       setIsLoading(true);
       setError(null);
       await syncPhase(sessionId, "execute");
@@ -364,6 +542,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
         if (dataSource.fileConfig) {
           const result = await executeFile.mutateAsync({
             sessionId,
+            runIndex: writeRunIndex,
             filePath: dataSource.fileConfig.filePath,
             fileType: dataSource.fileConfig.fileType,
             originalFileName: dataSource.fileConfig.fileName,
@@ -397,6 +576,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
 
         const result = await execute.mutateAsync({
           sessionId,
+          runIndex: writeRunIndex,
           steps: generatedSQL.steps,
           dbConfig: {
             host: dataSource.dbConfig.host,
@@ -450,10 +630,75 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
     ]
   );
 
+  /** 整库批量：为数据源内各表创建会话并生成 SQL */
+  const runBatchDatabasePipeline = useCallback(async (): Promise<boolean> => {
+    if (!sessionId || !dataSource || !isDbSourceType(dataSource.type) || !ensureWritable()) {
+      return false;
+    }
+    if (dataSource.fileConfig) {
+      toast.info("文件数据源暂不支持整库批量");
+      return false;
+    }
+
+    setIsPipelineRunning(true);
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const result = await batchDatabaseMut.mutateAsync({
+        sessionId,
+        maxTables: 10,
+      });
+      if (!result.success || !result.result) {
+        throw new Error(result.error || "整库批量失败");
+      }
+
+      const { processed, totalTables, results } = result.result;
+      const okCount = results.filter((r) => r.success).length;
+      const lines = results
+        .slice(0, 8)
+        .map((r) =>
+          r.success
+            ? `- ✅ \`${r.tableName}\`：评分 ${r.overallScore ?? "-"}，${r.ruleCount ?? 0} 条规则 → 会话 \`${r.sessionId}\``
+            : `- ❌ \`${r.tableName}\`：${r.error}`
+        )
+        .join("\n");
+
+      pushMessage(
+        sessionId,
+        "agent",
+        `📦 **整库批量 SQL** 完成：${okCount}/${processed} 张表成功（库内共 ${totalTables} 张表，本次处理 ${processed} 张）\n\n${lines}${
+          results.length > 8 ? "\n\n…" : ""
+        }`,
+        "generate"
+      );
+      await refreshLists();
+      return okCount > 0;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setError(msg);
+      pushMessage(sessionId, "agent", `❌ 整库批量失败：${msg}`, "explore");
+      return false;
+    } finally {
+      setIsPipelineRunning(false);
+      setIsLoading(false);
+    }
+  }, [
+    sessionId,
+    dataSource,
+    ensureWritable,
+    batchDatabaseMut,
+    pushMessage,
+    refreshLists,
+    setError,
+    setIsLoading,
+    setIsPipelineRunning,
+  ]);
+
   /** 按 Agent 计划逐步执行（仅运行 plan 中的步骤，非全量 runFullPipelineToSQL） */
   const runAgentPlanBySteps = useCallback(
     async (steps: AgentPlanStep[], tableName?: string): Promise<boolean> => {
-      if (!dataSource || !sessionId || steps.length === 0) return false;
+      if (!dataSource || !sessionId || steps.length === 0 || !ensureWritable()) return false;
 
       setIsPipelineRunning(true);
       setIsLoading(true);
@@ -472,7 +717,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
                 sessionId,
                 dataSource,
                 step.tableName ?? tableName ?? targetTable,
-                { exploreDb, exploreFile }
+                { exploreDb, exploreFile },
+                writeRunIndex
               );
               localExploration = exploration;
               setTargetTable(resolvedTable);
@@ -497,7 +743,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
               break;
             }
             case "confirmAll": {
-              await confirmAllRules.mutateAsync({ sessionId });
+              await confirmAllRules.mutateAsync({ sessionId, runIndex: writeRunIndex });
               localRules = localRules.map((r) =>
                 r.status === "skipped" ? r : { ...r, status: "confirmed" as const }
               );
@@ -559,19 +805,17 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
               break;
             }
             case "exportScripts": {
-              const bundleResult = await exportBundleMut.mutateAsync({ sessionId });
-              if (!bundleResult.success || !bundleResult.files) {
+              const bundleResult = await exportBundleMut.mutateAsync({ sessionId, asZip: true });
+              if (!bundleResult.success || !bundleResult.zipBase64) {
                 throw new Error(bundleResult.error || "导出脚本包失败");
               }
-              downloadJsonFile(
-                { manifest: bundleResult.manifest, files: bundleResult.files },
-                `cleaning-bundle-${sessionId}.json`
-              );
-              toast.success(`脚本包已导出（${bundleResult.files.length} 个文件）`);
+              downloadZipFromBase64(bundleResult.zipBase64, `cleaning-bundle-${sessionId}.zip`);
+              const fileCount = bundleResult.files?.length ?? 0;
+              toast.success(`脚本包已导出（${fileCount} 个文件，已打包为 zip）`);
               pushMessage(
                 sessionId,
                 "agent",
-                `📦 脚本包已导出（${bundleResult.files.length} 个文件），请在本地或调度系统执行 cleaning.sql`,
+                `📦 脚本包已导出（${fileCount} 个文件，cleaning-bundle-${sessionId}.zip），请在本地或调度系统执行 cleaning.sql`,
                 "generate"
               );
               break;
@@ -640,7 +884,10 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
   return {
     startExploration,
     startAnalysis,
+    runAutoExploreAndAnalyze,
     runFullPipelineToSQL,
+    runPipelineToGenerateSQL,
+    runBatchDatabasePipeline,
     runAgentPlanBySteps,
     generateCleaningSQL,
     executeSQL,

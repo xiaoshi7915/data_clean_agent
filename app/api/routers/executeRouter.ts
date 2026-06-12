@@ -7,16 +7,25 @@ import {
   generateRetryContext,
   applyManualFix,
 } from "../services/executionService";
+import { persistAfterQualityReport } from "../services/qualityComparisonService";
 import { executeFileCleaning } from "../services/fileCleaningService";
 import { updateSessionPhase, incrementRetryCount } from "../services/sessionService";
 import { resolveDbConfigInput } from "../services/sessionCredentialService";
-import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
+import {
+  validatePhaseTransition,
+  PhaseValidationError,
+  HistoricalRunWriteError,
+} from "../services/phaseValidator";
+import { persistExecution } from "../services/executionPersistenceService";
+import { runPostCleanExplore } from "../services/postCleanExploreService";
+import { resolveExistingUploadPath } from "../services/uploadPathService";
 
 export const executeRouter = createRouter({
   execute: rateLimitedMutation("execute.run")
     .input(
       z.object({
         sessionId: z.string(),
+        runIndex: z.number().int().positive().optional(),
         steps: z.array(
           z.object({
             stepNumber: z.number(),
@@ -63,7 +72,7 @@ export const executeRouter = createRouter({
         if (!isSqlDialectSupported(input.dialect)) {
           return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
-        await validatePhaseTransition(input.sessionId, "execute");
+        await validatePhaseTransition(input.sessionId, "execute", input.runIndex);
         const resolvedDbConfig = await resolveDbConfigInput(input.sessionId, input.dbConfig);
         const result = await executeSQLSteps(
           input.sessionId,
@@ -74,13 +83,37 @@ export const executeRouter = createRouter({
           input.metricsBefore
         );
 
+        if (
+          result.overallStatus === "success" &&
+          !input.dryRun
+        ) {
+          const realMetrics = await runPostCleanExplore(input.sessionId, input.metricsBefore);
+          if (realMetrics) {
+            result.metricsAfter = realMetrics;
+          }
+        }
+
+        await persistExecution(input.sessionId, result, { dryRun: input.dryRun });
+
+        if (
+          result.overallStatus === "success" &&
+          result.metricsAfter &&
+          !input.dryRun
+        ) {
+          await persistAfterQualityReport(
+            input.sessionId,
+            input.metricsBefore,
+            result.metricsAfter
+          );
+        }
+
         const phase = result.overallStatus === "failed" ? "retry" : "execute";
         await updateSessionPhase(input.sessionId, phase, "executed");
 
         return { success: true, result };
       } catch (error) {
         const message =
-          error instanceof PhaseValidationError
+          error instanceof PhaseValidationError || error instanceof HistoricalRunWriteError
             ? error.message
             : error instanceof Error
             ? error.message
@@ -93,6 +126,7 @@ export const executeRouter = createRouter({
     .input(
       z.object({
         sessionId: z.string(),
+        runIndex: z.number().int().positive().optional(),
         filePath: z.string(),
         fileType: z.enum(["csv", "json", "xml", "xlsx"]),
         originalFileName: z.string(),
@@ -118,9 +152,10 @@ export const executeRouter = createRouter({
             result: null,
           };
         }
-        await validatePhaseTransition(input.sessionId, "execute");
+        await validatePhaseTransition(input.sessionId, "execute", input.runIndex);
+        const resolvedFilePath = resolveExistingUploadPath(input.filePath);
         const result = await executeFileCleaning(
-          input.filePath,
+          resolvedFilePath,
           input.fileType,
           input.originalFileName,
           input.rules,
@@ -128,13 +163,27 @@ export const executeRouter = createRouter({
           input.dryRun
         );
 
+        await persistExecution(input.sessionId, result, { dryRun: input.dryRun });
+
+        if (
+          result.overallStatus === "success" &&
+          result.metricsAfter &&
+          !input.dryRun
+        ) {
+          await persistAfterQualityReport(
+            input.sessionId,
+            input.metricsBefore,
+            result.metricsAfter
+          );
+        }
+
         const phase = result.overallStatus === "failed" ? "retry" : "execute";
         await updateSessionPhase(input.sessionId, phase, "file_executed");
 
         return { success: true, result };
       } catch (error) {
         const message =
-          error instanceof PhaseValidationError
+          error instanceof PhaseValidationError || error instanceof HistoricalRunWriteError
             ? error.message
             : error instanceof Error
             ? error.message

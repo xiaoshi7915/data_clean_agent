@@ -2,7 +2,8 @@ import { eq, and } from "drizzle-orm";
 import { fieldMatchesAlias, getCanonicalFieldKey } from "@contracts/naturalLanguageAliases";
 import { getDb } from "../queries/connection";
 import { cleaningRules } from "@db/schema";
-import type { CleaningRule, RuleStatus, RuleUpdateIntent } from "@contracts/types";
+import { getCurrentRunIndex } from "./pipelineRunService";
+import type { CleaningAction, CleaningRule, RuleStatus, RuleUpdateIntent } from "@contracts/types";
 import type { RuleVariantOption } from "./analysisService";
 
 const BULK_ALL_FIELDS_PATTERNS = [
@@ -16,6 +17,15 @@ const BULK_ALL_FIELDS_PATTERNS = [
 ];
 
 const NULL_FILL_PATTERNS = [/null/i, /空值/, /空缺/, /缺失/, /为空/, /替换成?\s*null/i];
+
+/** NL 中表示「写入/填充固定值」的动词（含「补充为」） */
+const FILL_VALUE_VERB_PATTERN =
+  "(?:替换为|填成|填充为|补充为|补全为|补充|补全|换成|改为|设置为)";
+
+const REPLACE_ALL_PATTERNS = [
+  /都(?:替换|换|改|设置|补充|填|填充)/,
+  /(?:值|字段|列)(?:替换|换|改|补充)/,
+];
 
 /** 用户是否要求对所有字段做统一空值处理 */
 export function isBulkAllFieldsIntent(message: string): boolean {
@@ -31,7 +41,7 @@ export function extractFillValueFromMessage(message: string): string | number {
   if (/null/i.test(text) || /空值/.test(text)) return "NULL";
   const quoted = text.match(/[「『"']([^」』"']+)[」』"']/);
   if (quoted?.[1]) return normalizeFillValue(quoted[1]);
-  const fillMatch = text.match(/(?:填成|填充为|替换为|改成|换成)\s*([^\s，。；]+)/);
+  const fillMatch = text.match(new RegExp(`${FILL_VALUE_VERB_PATTERN}\\s*([^\\s，。；]+)`));
   if (fillMatch?.[1]) return normalizeFillValue(fillMatch[1]);
   return "NULL";
 }
@@ -97,29 +107,58 @@ function normalizeFieldName(name: string): string {
   return name.toLowerCase().replace(/[\s_-]+/g, "");
 }
 
-/** 按字段名模糊匹配规则（精确 → 别名 → 包含） */
-export function findRuleByField(rules: CleaningRule[], field: string): CleaningRule | undefined {
-  const target = normalizeFieldName(field);
-  if (!target) return undefined;
+function ruleHasFixedFillVariant(rule: CleaningRule): boolean {
+  const variants = rule.parameters.variants as RuleVariantOption[] | undefined;
+  return Boolean(variants?.some((v) => v.key === "fixed" && v.action === "fill_null"));
+}
 
-  const exact = rules.find((r) => normalizeFieldName(r.field) === target);
-  if (exact) return exact;
+/** 收集与字段名匹配的全部规则（精确 → 别名 → 包含） */
+function findAllRulesByField(rules: CleaningRule[], field: string): CleaningRule[] {
+  const target = normalizeFieldName(field);
+  if (!target) return [];
+
+  const exact = rules.filter((r) => normalizeFieldName(r.field) === target);
+  if (exact.length > 0) return exact;
 
   const canonical = getCanonicalFieldKey(field);
   if (canonical) {
-    const aliasMatch = rules.find((r) => fieldMatchesAlias(canonical, r.field));
-    if (aliasMatch) return aliasMatch;
+    const aliasMatches = rules.filter((r) => fieldMatchesAlias(canonical, r.field));
+    if (aliasMatches.length > 0) return aliasMatches;
   }
 
-  const aliasDirect = rules.find((r) => fieldMatchesAlias(field, r.field));
-  if (aliasDirect) return aliasDirect;
+  const aliasDirect = rules.filter((r) => fieldMatchesAlias(field, r.field));
+  if (aliasDirect.length > 0) return aliasDirect;
 
-  const partial = rules.find(
+  return rules.filter(
     (r) =>
       normalizeFieldName(r.field).includes(target) ||
       target.includes(normalizeFieldName(r.field))
   );
-  return partial;
+}
+
+function pickPreferredFillRule(matches: CleaningRule[]): CleaningRule | undefined {
+  if (matches.length === 0) return undefined;
+  const fillNull = matches.find((r) => r.action === "fill_null");
+  if (fillNull) return fillNull;
+  const withFixed = matches.find(ruleHasFixedFillVariant);
+  if (withFixed) return withFixed;
+  const nullFillCapable = matches.find(ruleSupportsNullFill);
+  if (nullFillCapable) return nullFillCapable;
+  return matches[0];
+}
+
+/** 按字段名模糊匹配规则（精确 → 别名 → 包含） */
+export function findRuleByField(
+  rules: CleaningRule[],
+  field: string,
+  options?: { preferFillNull?: boolean }
+): CleaningRule | undefined {
+  const matches = findAllRulesByField(rules, field);
+  if (matches.length === 0) return undefined;
+  if (options?.preferFillNull) {
+    return pickPreferredFillRule(matches);
+  }
+  return matches[0];
 }
 
 /** 将自然语言填充值规范化为可持久化 / 生成 SQL 的值 */
@@ -157,6 +196,16 @@ export function isSqlExpressionFillValue(value: unknown): boolean {
 export function normalizeRuleUpdateIntent(update: RuleUpdateIntent): RuleUpdateIntent {
   const normalized: RuleUpdateIntent = { ...update, field: update.field.trim() };
 
+  if (update.addDerivedColumn?.trim()) {
+    normalized.addDerivedColumn = update.addDerivedColumn.trim();
+    if (update.insertAfter?.trim()) {
+      normalized.insertAfter = update.insertAfter.trim();
+    } else if (!normalized.insertAfter) {
+      normalized.insertAfter = normalized.field;
+    }
+    return normalized;
+  }
+
   if (update.fillValue !== undefined && update.fillValue !== null) {
     normalized.fillValue = normalizeFillValue(
       update.fillValue as string | number | Record<string, unknown>
@@ -191,6 +240,7 @@ async function persistRuleUpdate(
   }
 ): Promise<void> {
   const db = getDb();
+  const runIndex = await getCurrentRunIndex(sessionId);
   const setPayload: Record<string, unknown> = {};
 
   if (updates.status) setPayload.status = updates.status;
@@ -205,13 +255,20 @@ async function persistRuleUpdate(
   await db
     .update(cleaningRules)
     .set(setPayload)
-    .where(and(eq(cleaningRules.sessionId, sessionId), eq(cleaningRules.ruleId, ruleId)));
+    .where(
+      and(
+        eq(cleaningRules.sessionId, sessionId),
+        eq(cleaningRules.runIndex, runIndex),
+        eq(cleaningRules.ruleId, ruleId)
+      )
+    );
 }
 
 function mergeVariantSelection(
   rule: CleaningRule,
   variantKey?: string,
-  fillValue?: string | number
+  fillValue?: string | number,
+  replaceAll?: boolean
 ): {
   parameters: Record<string, unknown>;
   action?: string;
@@ -223,8 +280,33 @@ function mergeVariantSelection(
   const variants = parameters.variants as RuleVariantOption[] | undefined;
   const effectiveKey = variantKey || (fillValue !== undefined ? "fixed" : undefined);
 
+  if (fillValue !== undefined) {
+    const fixedVariant = variants?.find((v) => v.key === "fixed");
+    if (fixedVariant) {
+      Object.assign(parameters, fixedVariant.parameters);
+      parameters.selectedVariant = "fixed";
+      parameters.variants = variants;
+      parameters.fillValue = fillValue;
+      parameters.strategy = "fixed";
+      if (replaceAll) {
+        parameters.replaceAll = true;
+      }
+      return {
+        parameters,
+        action: fixedVariant.action,
+        strategy: replaceAll
+          ? `将「${rule.field}」整列设为固定值`
+          : fixedVariant.strategy,
+        name: replaceAll ? `整列赋值 - ${rule.field}` : fixedVariant.name,
+        riskNote: isSqlExpressionFillValue(fillValue)
+          ? "将使用数据库当前时间函数填充"
+          : fixedVariant.riskNote ?? rule.riskNote,
+      };
+    }
+  }
+
   if (effectiveKey && variants?.length) {
-    const selected = variants.find((v) => v.key === effectiveKey) || variants[0];
+    const selected = variants.find((v) => v.key === effectiveKey);
     if (selected) {
       Object.assign(parameters, selected.parameters);
       parameters.selectedVariant = selected.key;
@@ -247,16 +329,24 @@ function mergeVariantSelection(
     parameters.fillValue = fillValue;
     parameters.strategy = "fixed";
     parameters.selectedVariant = "fixed";
+    if (replaceAll) {
+      parameters.replaceAll = true;
+    }
     if (variants?.length) {
       parameters.variants = variants;
+    }
+    if (rule.action === "standardize" && replaceAll) {
+      parameters.type = "constant_replace";
     }
     return {
       parameters,
       action: "fill_null",
-      strategy: `使用固定值填充「${rule.field}」空值`,
-      name: `空值填充(固定值) - ${rule.field}`,
+      strategy: replaceAll
+        ? `将「${rule.field}」整列设为固定值`
+        : `使用固定值填充「${rule.field}」空值`,
+      name: replaceAll ? `整列赋值 - ${rule.field}` : `空值填充(固定值) - ${rule.field}`,
       riskNote: isSqlExpressionFillValue(fillValue)
-        ? "将使用数据库当前时间函数填充空值"
+        ? "将使用数据库当前时间函数填充"
         : rule.riskNote,
     };
   }
@@ -293,6 +383,183 @@ function toCleaningRule(row: typeof cleaningRules.$inferSelect): CleaningRule {
   };
 }
 
+const DERIVED_COLUMN_SUFFIXES = ["_code", "_id", "_name", "_text", "_num", "_no"];
+
+/** 从衍生列名推断源字段（如 level_code → level） */
+export function inferSourceFieldFromDerivedColumn(targetColumn: string): string | undefined {
+  const lower = targetColumn.toLowerCase();
+  for (const suffix of DERIVED_COLUMN_SUFFIXES) {
+    if (lower.endsWith(suffix) && targetColumn.length > suffix.length) {
+      return targetColumn.slice(0, -suffix.length);
+    }
+  }
+  return undefined;
+}
+
+/** 解析「新增衍生列 / 映射列」类自然语言意图 */
+export function extractAddDerivedColumnFromMessage(
+  message: string,
+  _rules: CleaningRule[]
+): RuleUpdateIntent[] | undefined {
+  const text = message.trim();
+  if (!text) return undefined;
+
+  const hasAddKeyword = /(?:新增|添加|增加|add|create)/i.test(text);
+  const hasColumnKeyword = /(?:字段|列|column|field)/i.test(text);
+  const hasAfterPattern = /在\s*[a-zA-Z_][\w]*\s*(?:字段|列)?\s*后/i.test(text);
+  if (!hasAfterPattern && !(hasAddKeyword && hasColumnKeyword)) return undefined;
+
+  const patternAfterFirst =
+    /在\s*([a-zA-Z_][\w]*)\s*(?:字段|列)?\s*后\s*(?:新增|添加|增加)(?:一个)?\s*([a-zA-Z_][\w]*)\s*(?:字段|列)?(?:\s*作为\s*([a-zA-Z_][\w]*)\s*(?:字段|列)?(?:的)?映射)?/i;
+  const matchAfterFirst = text.match(patternAfterFirst);
+  if (matchAfterFirst) {
+    const insertAfter = matchAfterFirst[1].trim();
+    const targetColumn = matchAfterFirst[2].trim();
+    const sourceField = (matchAfterFirst[3] || insertAfter).trim();
+    if (targetColumn && sourceField && targetColumn.toLowerCase() !== sourceField.toLowerCase()) {
+      return [{ field: sourceField, addDerivedColumn: targetColumn, insertAfter }];
+    }
+  }
+
+  const patternAddFirst =
+    /(?:帮我)?(?:请)?(?:新增|添加|增加)(?:一个)?\s*([a-zA-Z_][\w]*)\s*(?:字段|列)?\s*(?:作为\s*([a-zA-Z_][\w]*)\s*(?:字段|列)?(?:的)?映射)?(?:\s*在\s*([a-zA-Z_][\w]*)\s*(?:字段|列)?\s*后)?/i;
+  const matchAddFirst = text.match(patternAddFirst);
+  if (matchAddFirst) {
+    const targetColumn = matchAddFirst[1].trim();
+    const sourceField = (
+      matchAddFirst[2] ||
+      matchAddFirst[3] ||
+      inferSourceFieldFromDerivedColumn(targetColumn)
+    )?.trim();
+    const insertAfter = (matchAddFirst[3] || sourceField)?.trim();
+    if (targetColumn && sourceField && targetColumn.toLowerCase() !== sourceField.toLowerCase()) {
+      return [{ field: sourceField, addDerivedColumn: targetColumn, insertAfter }];
+    }
+  }
+
+  return undefined;
+}
+
+async function insertDerivedColumnRule(
+  sessionId: string,
+  update: RuleUpdateIntent,
+  existingRules: CleaningRule[]
+): Promise<CleaningRule | null> {
+  const targetColumn = update.addDerivedColumn?.trim();
+  const sourceField = update.field.trim();
+  if (!targetColumn || !sourceField) return null;
+
+  const duplicate = existingRules.some(
+    (r) =>
+      r.field.toLowerCase() === targetColumn.toLowerCase() ||
+      String(r.parameters.targetColumn ?? "").toLowerCase() === targetColumn.toLowerCase()
+  );
+  if (duplicate) return null;
+
+  const db = getDb();
+  const runIndex = await getCurrentRunIndex(sessionId);
+  const sourceRule = findRuleByField(existingRules, sourceField);
+  const insertAfter = update.insertAfter?.trim() || sourceField;
+  const nextIndex =
+    existingRules.length > 0 ? Math.max(...existingRules.map((r) => r.index)) + 1 : 1;
+  const ruleId = `derived_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const strategy = `在「${insertAfter}」后新增「${targetColumn}」，由「${sourceField}」映射生成`;
+  const parameters: Record<string, unknown> = {
+    targetColumn,
+    part: "derived_mapping",
+    sourceField,
+    insertAfter,
+    isCustom: true,
+    fromNaturalLanguage: true,
+  };
+
+  await db.insert(cleaningRules).values({
+    sessionId,
+    runIndex,
+    ruleId,
+    ruleIndex: nextIndex,
+    name: `衍生列 - ${targetColumn}（映射 ${sourceField}）`,
+    field: sourceField,
+    action: "split" as CleaningAction,
+    issueDescription: strategy,
+    strategy,
+    affectedRows: sourceRule?.affectedRows ?? 0,
+    affectedPercent: String(sourceRule?.affectedPercent ?? 0),
+    parameters,
+    status: "confirmed",
+    riskNote: "对话新增的衍生列已自动确认，可直接生成 SQL",
+  });
+
+  return {
+    id: ruleId,
+    index: nextIndex,
+    name: `衍生列 - ${targetColumn}（映射 ${sourceField}）`,
+    field: sourceField,
+    action: "split",
+    issueDescription: strategy,
+    strategy,
+    affectedRows: sourceRule?.affectedRows ?? 0,
+    affectedPercent: sourceRule?.affectedPercent ?? 0,
+    parameters,
+    status: "confirmed",
+    riskNote: "对话新增的衍生列已自动确认，可直接生成 SQL",
+  };
+}
+
+/** 从单条 NL 消息推断字段级规则修改（LLM 未返回 ruleUpdates 时的兜底） */
+export function extractRuleUpdatesFromMessage(
+  message: string,
+  rules: CleaningRule[]
+): RuleUpdateIntent[] | undefined {
+  const text = message.trim();
+  if (!text) return undefined;
+
+  const derived = extractAddDerivedColumnFromMessage(text, rules);
+  if (derived?.length) return derived;
+
+  if (rules.length === 0) return undefined;
+
+  const bulk = expandBulkRuleUpdatesFromMessage(text, rules);
+  if (bulk?.length) return bulk;
+
+  const replacePatterns = [
+    new RegExp(
+      `(?:帮(?:我|忙)?)?(?:把|将)\\s*([a-zA-Z_][\\w]*)\\s*(?:字段|列)?(?:的(?:值|空值)?)?(?:都)?${FILL_VALUE_VERB_PATTERN}\\s*(.+?)(?:[。；，!！?？]|$)`
+    ),
+    new RegExp(
+      `([a-zA-Z_][\\w]*)\\s*(?:字段|列)?(?:的(?:值|空值)?)?(?:都)?${FILL_VALUE_VERB_PATTERN}\\s*(.+?)(?:[。；，!！?？]|$)`
+    ),
+  ];
+
+  for (const pattern of replacePatterns) {
+    const match = text.match(pattern);
+    if (!match) continue;
+
+    const field = match[1].trim();
+    const rawValue = match[2].trim();
+    if (!field || !rawValue) continue;
+
+    const rule = findRuleByField(rules, field, { preferFillNull: true });
+    if (!rule) continue;
+
+    const fillValue = normalizeFillValue(rawValue);
+    const replaceAll =
+      REPLACE_ALL_PATTERNS.some((p) => p.test(text)) ||
+      (/都/.test(text) && /补充|补全/.test(text));
+
+    return [
+      {
+        field: rule.field,
+        variantKey: "fixed",
+        fillValue,
+        replaceAll,
+      },
+    ];
+  }
+
+  return undefined;
+}
+
 /**
  * 将 LLM 解析出的 ruleUpdates 应用到会话规则（模糊匹配字段名）
  */
@@ -316,6 +583,11 @@ export async function applyRuleUpdatesFromNL(
     const expanded = expandBulkRuleUpdatesFromMessage(options.sourceMessage, existingRules);
     if (expanded?.length) {
       effectiveUpdates = expanded;
+    } else {
+      const inferred = extractRuleUpdatesFromMessage(options.sourceMessage, existingRules);
+      if (inferred?.length) {
+        effectiveUpdates = inferred;
+      }
     }
   }
 
@@ -323,14 +595,46 @@ export async function applyRuleUpdatesFromNL(
 
   for (const rawUpdate of effectiveUpdates) {
     const update = normalizeRuleUpdateIntent(rawUpdate);
-    const rule = findRuleByField(existingRules, update.field);
+
+    if (update.addDerivedColumn) {
+      try {
+        const inserted = await insertDerivedColumnRule(
+          sessionId,
+          update,
+          Array.from(rulesById.values())
+        );
+        if (inserted) {
+          rulesById.set(inserted.id, inserted);
+          summaries.push(
+            `新增衍生列「${update.addDerivedColumn}」（映射源字段「${update.field}」），已自动确认，可直接生成 SQL`
+          );
+          applied += 1;
+        } else {
+          errors.push(`衍生列「${update.addDerivedColumn}」已存在或无法创建`);
+        }
+      } catch (err) {
+        errors.push(
+          `新增衍生列「${update.addDerivedColumn}」失败：${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      continue;
+    }
+
+    const rule = findRuleByField(existingRules, update.field, {
+      preferFillNull: update.fillValue !== undefined,
+    });
     if (!rule) {
       errors.push(`未找到字段「${update.field}」对应的清洗规则`);
       continue;
     }
 
     const status = parseStatusAction(update.action);
-    const merged = mergeVariantSelection(rule, update.variantKey, update.fillValue);
+    const merged = mergeVariantSelection(
+      rule,
+      update.variantKey,
+      update.fillValue,
+      update.replaceAll
+    );
     const working = rulesById.get(rule.id) || rule;
 
     try {
@@ -375,10 +679,11 @@ export async function applyRuleUpdatesFromNL(
   }
 
   const db = getDb();
+  const runIndex = await getCurrentRunIndex(sessionId);
   const rows = await db
     .select()
     .from(cleaningRules)
-    .where(eq(cleaningRules.sessionId, sessionId))
+    .where(and(eq(cleaningRules.sessionId, sessionId), eq(cleaningRules.runIndex, runIndex)))
     .orderBy(cleaningRules.ruleIndex);
 
   return {

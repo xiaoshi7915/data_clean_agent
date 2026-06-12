@@ -13,6 +13,8 @@ import { RuleRecommendationsPanel } from "@/components/rules/RuleRecommendations
 import { SQLPanel } from "@/components/sql/SQLPanel";
 import { ArrowRight, Download, FileCode2, ListChecks } from "lucide-react";
 import { downloadJsonFile } from "@/lib/downloadReport";
+import { RunDiffBanner } from "@/components/RunDiffBanner";
+import type { PipelineRunDiff } from "@/lib/pipelineRunDiff";
 import type {
   CleaningRule,
   DataSourceConfig,
@@ -40,6 +42,8 @@ interface SessionDialogsProps {
   onSelectTable: (table: string) => void;
   onExplore: (table: string) => void;
   onRunFullPipeline?: (table: string) => void | Promise<void>;
+  /** 选表面板探查按钮文案（开始探查 / 重新探查） */
+  tableExploreButtonLabel?: string;
   explorationResult: ExplorationResult | null;
   qualityReport: QualityReport | null;
   cleaningRules: CleaningRule[];
@@ -64,6 +68,10 @@ interface SessionDialogsProps {
   ) => void | Promise<boolean>;
   isLoading: boolean;
   isPipelineRunning?: boolean;
+  /** 历史 run 只读 */
+  readOnly?: boolean;
+  /** 与上一 run 的差异（高亮用） */
+  runDiff?: PipelineRunDiff | null;
 }
 
 export function SessionDialogs({
@@ -76,6 +84,7 @@ export function SessionDialogs({
   onSelectTable,
   onExplore,
   onRunFullPipeline,
+  tableExploreButtonLabel,
   explorationResult,
   qualityReport,
   cleaningRules,
@@ -97,13 +106,18 @@ export function SessionDialogs({
   onImportContract,
   isLoading,
   isPipelineRunning = false,
+  readOnly = false,
+  runDiff = null,
 }: SessionDialogsProps) {
   const confirmedCount = cleaningRules.filter((r) => r.status === "confirmed").length;
   const pendingCount = cleaningRules.filter((r) => r.status === "pending").length;
 
   return (
     <>
-      <Dialog open={openDialog === "selectTable"} onOpenChange={(o) => !o && onClose()}>
+      <Dialog
+        open={openDialog === "selectTable" && !dataSource?.fileConfig}
+        onOpenChange={(o) => !o && onClose()}
+      >
         <DialogContent className="sm:max-w-4xl w-full min-w-[36rem] max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>选择要探查的数据表</DialogTitle>
@@ -115,6 +129,7 @@ export function SessionDialogs({
               dataSource={dataSource}
               selectedTable={targetTable}
               onSelectTable={onSelectTable}
+              exploreButtonLabel={tableExploreButtonLabel}
               onExplore={(table) => {
                 onExplore(table);
                 onClose();
@@ -192,10 +207,17 @@ export function SessionDialogs({
             <DialogTitle className="text-base">质量分析报告</DialogTitle>
           </DialogHeader>
           <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-6">
+            {runDiff?.hasBaseline && (
+              <div className="pt-4">
+                <RunDiffBanner diff={runDiff} />
+              </div>
+            )}
             {qualityReport && (
               <QualityPanel
                 report={qualityReport}
+                scoreDiff={runDiff?.scores}
                 onConfirmAll={() => {
+                  if (readOnly) return;
                   onClose();
                   onConfirmAllRules();
                 }}
@@ -223,6 +245,8 @@ export function SessionDialogs({
               embedded
               hideFooter
               rules={cleaningRules}
+              readOnly={readOnly}
+              ruleDiff={runDiff?.rules}
               availableFields={explorationResult?.schema.map((c) => c.name) ?? []}
               onRuleStatusChange={onRuleStatusChange}
               onParameterChange={onRuleParameterChange}
@@ -247,7 +271,7 @@ export function SessionDialogs({
                 <Button
                   variant="outline"
                   onClick={onConfirmAllRules}
-                  disabled={isLoading}
+                  disabled={isLoading || readOnly}
                   className="gap-2"
                 >
                   <ListChecks className="w-4 h-4" />
@@ -259,7 +283,7 @@ export function SessionDialogs({
                   onClose();
                   onGenerateSQL();
                 }}
-                disabled={isLoading || confirmedCount === 0}
+                disabled={isLoading || readOnly || confirmedCount === 0}
                 className="gap-2"
               >
                 {isLoading ? (
@@ -290,6 +314,8 @@ export function SessionDialogs({
               <SQLPanel
                 embedded
                 sqlResult={generatedSQL}
+                readOnly={readOnly}
+                stepDiff={runDiff?.sqlSteps}
                 scriptOnly={scriptOnly}
                 onExecute={() => {
                   onClose();

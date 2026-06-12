@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { eq } from "drizzle-orm";
+import { eq, and } from "drizzle-orm";
 import { createRouter, rateLimitedMutation } from "../middleware";
 import { getDb } from "../queries/connection";
 import { cleaningRules } from "@db/schema";
@@ -24,14 +24,21 @@ const ORCHESTRATOR_ACTIONS: ChatActionIntent[] = [
 import {
   applyRuleUpdatesFromNL,
   expandBulkRuleUpdatesFromMessage,
+  extractAddDerivedColumnFromMessage,
+  extractRuleUpdatesFromMessage,
   isBulkAllFieldsIntent,
 } from "../services/ruleIntentService";
+import { detectReferenceUploadIntent } from "../services/referenceIntentService";
+import { parseCodeTableFile, codeTableToDictMap, buildCodeTableRuleParameters } from "../services/codeTableParser";
+import { parseDataStandardFile, dataStandardToRuleParams } from "../services/dataStandardParser";
+import { insertReferenceRules } from "./referenceRouter";
 import { detectMultiIntent } from "../services/agentService";
+import { getCurrentRunIndex } from "../services/pipelineRunService";
 import {
   handleUserMessage as handleOrchestratorMessage,
   handleMultiStepPlan,
 } from "../agents/orchestrator";
-import type { CleaningRule, RuleStatus } from "@contracts/types";
+import type { CleaningRule, RuleStatus, RuleUpdateIntent } from "@contracts/types";
 
 function mapActionToClient(action?: ChatActionIntent) {
   if (!action || action === "none") return undefined;
@@ -67,6 +74,61 @@ function loadRulesFromRows(rows: (typeof cleaningRules.$inferSelect)[]): Cleanin
     preview: r.preview as CleaningRule["preview"],
     riskNote: r.riskNote || undefined,
   }));
+}
+
+async function loadRulesForCurrentRun(sessionId: string): Promise<CleaningRule[]> {
+  const db = getDb();
+  const runIndex = await getCurrentRunIndex(sessionId);
+  const ruleRows = await db
+    .select()
+    .from(cleaningRules)
+    .where(and(eq(cleaningRules.sessionId, sessionId), eq(cleaningRules.runIndex, runIndex)))
+    .orderBy(cleaningRules.ruleIndex);
+  return loadRulesFromRows(ruleRows);
+}
+
+function normalizeFieldKey(field: string): string {
+  return field.toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+/** 将 LLM 返回的 ruleUpdates 与 NL 兜底解析结果合并（补全 fillValue / replaceAll） */
+function mergeLlmWithInferredUpdates(
+  llmRuleUpdates: RuleUpdateIntent[],
+  inferredUpdates?: RuleUpdateIntent[]
+): RuleUpdateIntent[] {
+  if (!inferredUpdates?.length) return llmRuleUpdates;
+
+  return llmRuleUpdates.map((llm) => {
+    const inferred = inferredUpdates.find(
+      (item) => normalizeFieldKey(item.field) === normalizeFieldKey(llm.field)
+    );
+    if (!inferred) return llm;
+    return {
+      ...llm,
+      fillValue: llm.fillValue ?? inferred.fillValue,
+      variantKey: llm.variantKey ?? inferred.variantKey,
+      replaceAll: llm.replaceAll ?? inferred.replaceAll,
+    };
+  });
+}
+
+function resolveUpdatesToApply(
+  userMessage: string,
+  existingRules: CleaningRule[],
+  llmRuleUpdates?: RuleUpdateIntent[]
+): RuleUpdateIntent[] | undefined {
+  const derivedUpdates = extractAddDerivedColumnFromMessage(userMessage, existingRules);
+  if (derivedUpdates?.length) return derivedUpdates;
+
+  const bulkUpdates = expandBulkRuleUpdatesFromMessage(userMessage, existingRules);
+  const inferredUpdates = extractRuleUpdatesFromMessage(userMessage, existingRules);
+
+  if (llmRuleUpdates?.length) {
+    return mergeLlmWithInferredUpdates(llmRuleUpdates, inferredUpdates);
+  }
+  if (bulkUpdates?.length) return bulkUpdates;
+
+  return inferredUpdates?.length ? inferredUpdates : undefined;
 }
 
 export const chatRouter = createRouter({
@@ -122,18 +184,17 @@ export const chatRouter = createRouter({
 
         // 多步 NL：统一走 orchestrator（orchestration_runs 为唯一状态源）
         if (input.sessionId && multiIntent) {
-          const db = getDb();
-          const ruleRows = await db
-            .select()
-            .from(cleaningRules)
-            .where(eq(cleaningRules.sessionId, input.sessionId))
-            .orderBy(cleaningRules.ruleIndex);
-          const existingRules = loadRulesFromRows(ruleRows);
+          const existingRules = await loadRulesForCurrentRun(input.sessionId);
+          const updatesToApply = resolveUpdatesToApply(
+            input.userMessage,
+            existingRules,
+            result.ruleUpdates
+          );
 
-          if (result.ruleUpdates?.length) {
+          if (updatesToApply?.length) {
             const applyResult = await applyRuleUpdatesFromNL(
               input.sessionId,
-              result.ruleUpdates,
+              updatesToApply,
               existingRules,
               { sourceMessage: input.userMessage }
             );
@@ -193,21 +254,13 @@ export const chatRouter = createRouter({
             }
           }
 
-          const db = getDb();
-          const ruleRows = await db
-            .select()
-            .from(cleaningRules)
-            .where(eq(cleaningRules.sessionId, input.sessionId))
-            .orderBy(cleaningRules.ruleIndex);
-          const existingRules = loadRulesFromRows(ruleRows);
+          const existingRules = await loadRulesForCurrentRun(input.sessionId);
 
-          const bulkUpdates = expandBulkRuleUpdatesFromMessage(input.userMessage, existingRules);
-          const updatesToApply =
-            result.ruleUpdates?.length
-              ? result.ruleUpdates
-              : bulkUpdates?.length
-                ? bulkUpdates
-                : undefined;
+          const updatesToApply = resolveUpdatesToApply(
+            input.userMessage,
+            existingRules,
+            result.ruleUpdates
+          );
 
           if (updatesToApply?.length) {
             const applyResult = await applyRuleUpdatesFromNL(
@@ -237,6 +290,52 @@ export const chatRouter = createRouter({
           } else if (isBulkAllFieldsIntent(input.userMessage)) {
             message =
               "未找到可批量修改的空值填充规则。请先完成质量分析生成规则，或指定具体字段名。";
+          }
+        }
+
+        // 码表 / 数据标准上传意图：解析文件并合并清洗规则
+        if (input.sessionId) {
+          const refIntent = detectReferenceUploadIntent(input.userMessage);
+          if (refIntent) {
+            try {
+              if (refIntent.kind === "code_table") {
+                const parsed = parseCodeTableFile(refIntent.filePath);
+                if (parsed.entries.length > 0) {
+                  const dictByField = codeTableToDictMap(parsed.entries);
+                  const items = Object.entries(dictByField).map(([field, dictMap]) => ({
+                    field,
+                    name: `码表映射：${field}`,
+                    action: "standardize" as const,
+                    strategy: `码表 ${Object.keys(dictMap).length} 条映射`,
+                    parameters: buildCodeTableRuleParameters(field, dictMap),
+                  }));
+                  const added = await insertReferenceRules(input.sessionId, items);
+                  ruleUpdatesApplied += added;
+                  message = `${message}\n\n✅ 已导入码表，新增 ${added} 条 standardize 规则`;
+                  result = { ...result, action: "updateRule" };
+                }
+              } else {
+                const parsed = parseDataStandardFile(refIntent.filePath);
+                if (parsed.rules.length > 0) {
+                  const items = parsed.rules.map((r) => {
+                    const converted = dataStandardToRuleParams(r);
+                    return {
+                      field: r.field,
+                      name: converted.name,
+                      action: converted.action as "format" | "standardize",
+                      strategy: r.description ?? `数据标准：${r.field}`,
+                      parameters: converted.parameters,
+                    };
+                  });
+                  const added = await insertReferenceRules(input.sessionId, items);
+                  ruleUpdatesApplied += added;
+                  message = `${message}\n\n✅ 已导入数据标准，新增 ${added} 条规则`;
+                  result = { ...result, action: "updateRule" };
+                }
+              }
+            } catch (refErr) {
+              message = `${message}\n\n⚠️ 参考文件解析失败：${refErr instanceof Error ? refErr.message : String(refErr)}`;
+            }
           }
         }
 

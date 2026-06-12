@@ -12,7 +12,9 @@ import type {
   ChatMessage,
   SessionListItem,
   SavedDataSourceItem,
+  PipelineRunSummary,
 } from "@contracts/types";
+import type { PipelineRunSnapshot } from "@/lib/pipelineRunDiff";
 
 /** 数据库类数据源类型列表 */
 export const DB_SOURCE_TYPES = [
@@ -40,6 +42,7 @@ export function useCleaningSessionState() {
   const [cleaningRules, setCleaningRules] = useState<CleaningRule[]>([]);
   const [generatedSQL, setGeneratedSQL] = useState<SQLGenerationResult | null>(null);
   const [executionResult, setExecutionResult] = useState<ExecutionResult | null>(null);
+  const [executionHistory, setExecutionHistory] = useState<ExecutionResult[]>([]);
   const [retryContext, setRetryContext] = useState<RetryContext | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sessionList, setSessionList] = useState<SessionListItem[]>([]);
@@ -48,6 +51,14 @@ export function useCleaningSessionState() {
   const [isPipelineRunning, setIsPipelineRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState(0);
+  const [currentRunIndex, setCurrentRunIndex] = useState(1);
+  const [viewingRunIndex, setViewingRunIndex] = useState(1);
+  const [pipelineRuns, setPipelineRuns] = useState<PipelineRunSummary[]>([]);
+  /** 对比基准 run 快照（通常为 viewingRunIndex - 1） */
+  const [compareRunSnapshot, setCompareRunSnapshot] = useState<PipelineRunSnapshot | null>(null);
+  /** null 表示查看当前 live 状态；非 null 为历史 revision 快照 */
+  const [viewingRevisionIndex, setViewingRevisionIndex] = useState<number | null>(null);
+  const [latestRevisionIndex, setLatestRevisionIndex] = useState(0);
 
   const utils = trpc.useUtils();
   const createSession = trpc.session.create.useMutation();
@@ -55,6 +66,8 @@ export function useCleaningSessionState() {
   const saveDataSourceMut = trpc.session.saveDataSource.useMutation();
   const saveMessageMut = trpc.session.addMessage.useMutation();
   const updatePhaseMut = trpc.session.updatePhase.useMutation();
+  const resetPipelineMut = trpc.session.resetPipeline.useMutation();
+  const updateTargetTableMut = trpc.session.updateTargetTable.useMutation();
   const exploreDb = trpc.explore.exploreDatabase.useMutation();
   const exploreFile = trpc.explore.exploreFile.useMutation();
   const analyze = trpc.analyze.analyze.useMutation();
@@ -67,6 +80,7 @@ export function useCleaningSessionState() {
   const getRetryCtx = trpc.execute.getRetryContext.useMutation();
   const applyFix = trpc.execute.applyFix.useMutation();
   const deleteSessionMut = trpc.session.delete.useMutation();
+  const deleteDataSourceMut = trpc.session.deleteDataSource.useMutation();
   const modifySqlStepMut = trpc.sql.modifyStep.useMutation();
   const updateRuleParams = trpc.rules.updateParameters.useMutation();
   const createCustomRuleMut = trpc.rules.createCustom.useMutation();
@@ -74,6 +88,8 @@ export function useCleaningSessionState() {
   const chatSend = trpc.chat.send.useMutation();
   const importContractMut = trpc.contract.importContract.useMutation();
   const exportBundleMut = trpc.artifact.exportBundle.useMutation();
+  const createSnapshotMut = trpc.snapshot.create.useMutation();
+  const batchDatabaseMut = trpc.batch.runDatabaseBatch.useMutation();
 
   const refreshLists = useCallback(async () => {
     try {
@@ -126,9 +142,16 @@ export function useCleaningSessionState() {
     setCleaningRules([]);
     setGeneratedSQL(null);
     setExecutionResult(null);
+    setExecutionHistory([]);
     setRetryContext(null);
     setMessages([]);
     setRetryCount(0);
+    setCurrentRunIndex(1);
+    setViewingRunIndex(1);
+    setPipelineRuns([]);
+    setCompareRunSnapshot(null);
+    setViewingRevisionIndex(null);
+    setLatestRevisionIndex(0);
     setError(null);
   }, []);
 
@@ -155,6 +178,8 @@ export function useCleaningSessionState() {
     setGeneratedSQL,
     executionResult,
     setExecutionResult,
+    executionHistory,
+    setExecutionHistory,
     retryContext,
     setRetryContext,
     messages,
@@ -169,6 +194,18 @@ export function useCleaningSessionState() {
     setError,
     retryCount,
     setRetryCount,
+    currentRunIndex,
+    setCurrentRunIndex,
+    viewingRunIndex,
+    setViewingRunIndex,
+    pipelineRuns,
+    setPipelineRuns,
+    compareRunSnapshot,
+    setCompareRunSnapshot,
+    viewingRevisionIndex,
+    setViewingRevisionIndex,
+    latestRevisionIndex,
+    setLatestRevisionIndex,
     utils,
     mutations: {
       createSession,
@@ -176,6 +213,8 @@ export function useCleaningSessionState() {
       saveDataSourceMut,
       saveMessageMut,
       updatePhaseMut,
+      resetPipelineMut,
+      updateTargetTableMut,
       exploreDb,
       exploreFile,
       analyze,
@@ -188,6 +227,7 @@ export function useCleaningSessionState() {
       getRetryCtx,
       applyFix,
       deleteSessionMut,
+      deleteDataSourceMut,
       modifySqlStepMut,
       updateRuleParams,
       createCustomRuleMut,
@@ -195,6 +235,8 @@ export function useCleaningSessionState() {
       chatSend,
       importContractMut,
       exportBundleMut,
+      createSnapshotMut,
+      batchDatabaseMut,
     },
     refreshLists,
     syncPhase,

@@ -29,6 +29,8 @@ import {
   Database,
 } from "lucide-react";
 import type { SQLGenerationResult } from "@contracts/types";
+import type { SqlStepDiffEntry } from "@/lib/pipelineRunDiff";
+import { diffKindClassName, diffKindLabel } from "@/lib/pipelineRunDiff";
 
 interface SQLPanelProps {
   sqlResult: SQLGenerationResult;
@@ -41,6 +43,8 @@ interface SQLPanelProps {
   embedded?: boolean;
   /** SCRIPT_ONLY 模式：隐藏真实执行，显示导出脚本包 */
   scriptOnly?: boolean;
+  readOnly?: boolean;
+  stepDiff?: SqlStepDiffEntry[];
 }
 
 export function SQLPanel({
@@ -53,7 +57,10 @@ export function SQLPanel({
   isLoading,
   embedded,
   scriptOnly = false,
+  readOnly = false,
+  stepDiff,
 }: SQLPanelProps) {
+  const stepDiffMap = new Map((stepDiff ?? []).map((s) => [s.stepNumber, s.kind]));
   const [activeTab, setActiveTab] = useState(embedded ? "consolidated" : "overview");
   const [editingStep, setEditingStep] = useState<number | null>(null);
   const [editValue, setEditValue] = useState("");
@@ -89,7 +96,7 @@ export function SQLPanel({
             <div className="flex items-center justify-between">
               <CardTitle className="text-sm flex items-center gap-2">
                 <FileCode2 className="w-4 h-4 text-primary" />
-                主清洗 SQL（单条 INSERT SELECT）
+                主清洗 SQL（CREATE TABLE + INSERT SELECT）
               </CardTitle>
               <Button
                 variant="ghost"
@@ -216,10 +223,24 @@ export function SQLPanel({
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {sqlResult.steps.map((step) => (
-                      <TableRow key={step.stepNumber}>
+                    {sqlResult.steps.map((step) => {
+                      const diffKind = stepDiffMap.get(step.stepNumber);
+                      return (
+                      <TableRow
+                        key={step.stepNumber}
+                        className={
+                          diffKind && diffKind !== "unchanged"
+                            ? `border ${diffKindClassName(diffKind)}`
+                            : undefined
+                        }
+                      >
                         <TableCell className="font-mono text-xs font-medium">
                           {step.stepNumber}
+                          {diffKind && diffKind !== "unchanged" && (
+                            <Badge variant="outline" className={`ml-1 text-[9px] ${diffKindClassName(diffKind)}`}>
+                              {diffKindLabel(diffKind)}
+                            </Badge>
+                          )}
                         </TableCell>
                         <TableCell className="text-sm font-medium">{step.name}</TableCell>
                         <TableCell>
@@ -257,7 +278,8 @@ export function SQLPanel({
                           </div>
                         </TableCell>
                       </TableRow>
-                    ))}
+                    );
+                    })}
                   </TableBody>
                 </Table>
               </ScrollArea>
@@ -292,7 +314,8 @@ export function SQLPanel({
                       variant="ghost"
                       size="sm"
                       className="h-7 w-7 p-0"
-                      onClick={() => handleEdit(step)}
+                      onClick={() => !readOnly && handleEdit(step)}
+                      disabled={readOnly}
                     >
                       <Pencil className="w-3.5 h-3.5" />
                     </Button>
@@ -393,12 +416,12 @@ export function SQLPanel({
               导出脚本包
             </Button>
           )}
-          <Button variant="outline" onClick={onDryRun} disabled={isLoading} className="gap-1.5">
+          <Button variant="outline" onClick={onDryRun} disabled={isLoading || readOnly} className="gap-1.5">
             <TestTube className="w-4 h-4" />
             模拟执行
           </Button>
           {!scriptOnly && (
-            <Button onClick={onExecute} disabled={isLoading} className="gap-2">
+            <Button onClick={onExecute} disabled={isLoading || readOnly} className="gap-2">
               {isLoading ? (
                 <span className="w-4 h-4 border-2 border-current border-t-transparent rounded-full animate-spin" />
               ) : (

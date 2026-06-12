@@ -6,8 +6,135 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { CleaningRule } from "@contracts/types";
+import type { CleaningRule, InvalidAction, UnmatchedStrategy } from "@contracts/types";
 import { fillStrategyLabels, variantLabels } from "./rulesShared";
+import {
+  INVALID_ACTION_RULE_TYPES,
+  UNMATCHED_STRATEGY_RULE_TYPES,
+} from "../../../api/services/cleaningActionRegistry";
+import { pickRuleVariantDefaultKey } from "../../../api/services/analysisService";
+
+const INVALID_ACTION_LABELS: Record<InvalidAction, string> = {
+  reject: "删除行（reject）",
+  keep: "保留原值",
+  null: "置为 NULL",
+  empty_string: "置为空字符串",
+  custom: "自定义值",
+  flag: "标记无效（flag）",
+};
+
+const UNMATCHED_STRATEGY_LABELS: Record<UnmatchedStrategy, string> = {
+  keep: "保留原值",
+  null: "置为 NULL",
+  custom: "自定义值",
+  reject: "删除行",
+};
+
+/** 校验规则 invalidAction 编辑器 */
+export function InvalidActionParameterEditor({
+  rule,
+  onParameterChange,
+}: {
+  rule: CleaningRule;
+  onParameterChange: (ruleId: string, params: Record<string, unknown>) => void;
+}) {
+  const ruleType = rule.parameters.type as string | undefined;
+  if (!ruleType || !INVALID_ACTION_RULE_TYPES.has(ruleType)) return null;
+
+  const invalidAction = (rule.parameters.invalidAction as InvalidAction) || "null";
+
+  return (
+    <div className="mt-1.5 space-y-1" onClick={(e) => e.stopPropagation()}>
+      <Select
+        value={invalidAction}
+        onValueChange={(value: InvalidAction) =>
+          onParameterChange(rule.id, { ...rule.parameters, invalidAction: value })
+        }
+      >
+        <SelectTrigger size="sm" className="h-7 w-full max-w-[240px] text-xs">
+          <SelectValue placeholder="无效值处理" />
+        </SelectTrigger>
+        <SelectContent position="popper" className="z-[110]">
+          {(Object.keys(INVALID_ACTION_LABELS) as InvalidAction[]).map((key) => (
+            <SelectItem key={key} value={key}>
+              {INVALID_ACTION_LABELS[key]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {invalidAction === "custom" && (
+        <Input
+          className="h-7 text-xs max-w-[240px]"
+          value={String(rule.parameters.customValue ?? "")}
+          onChange={(e) =>
+            onParameterChange(rule.id, {
+              ...rule.parameters,
+              invalidAction: "custom",
+              customValue: e.target.value,
+            })
+          }
+          placeholder="无效时的自定义值"
+        />
+      )}
+    </div>
+  );
+}
+
+/** 码表 dictMap 未匹配策略编辑器 */
+export function UnmatchedStrategyEditor({
+  rule,
+  onParameterChange,
+}: {
+  rule: CleaningRule;
+  onParameterChange: (ruleId: string, params: Record<string, unknown>) => void;
+}) {
+  const ruleType = rule.parameters.type as string | undefined;
+  const fromCodeTable = rule.parameters.fromCodeTable === true;
+  if (
+    !fromCodeTable &&
+    (!ruleType || !UNMATCHED_STRATEGY_RULE_TYPES.has(ruleType))
+  ) {
+    return null;
+  }
+
+  const strategy = (rule.parameters.unmatchedStrategy as UnmatchedStrategy) || "keep";
+
+  return (
+    <div className="mt-1.5 space-y-1" onClick={(e) => e.stopPropagation()}>
+      <Select
+        value={strategy}
+        onValueChange={(value: UnmatchedStrategy) =>
+          onParameterChange(rule.id, { ...rule.parameters, unmatchedStrategy: value })
+        }
+      >
+        <SelectTrigger size="sm" className="h-7 w-full max-w-[240px] text-xs">
+          <SelectValue placeholder="未匹配值处理" />
+        </SelectTrigger>
+        <SelectContent position="popper" className="z-[110]">
+          {(Object.keys(UNMATCHED_STRATEGY_LABELS) as UnmatchedStrategy[]).map((key) => (
+            <SelectItem key={key} value={key}>
+              {UNMATCHED_STRATEGY_LABELS[key]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {strategy === "custom" && (
+        <Input
+          className="h-7 text-xs max-w-[240px]"
+          value={String(rule.parameters.customUnmatchedValue ?? "")}
+          onChange={(e) =>
+            onParameterChange(rule.id, {
+              ...rule.parameters,
+              unmatchedStrategy: "custom",
+              customUnmatchedValue: e.target.value,
+            })
+          }
+          placeholder="未匹配时的自定义值"
+        />
+      )}
+    </div>
+  );
+}
 
 export type RuleVariantOption = {
   key: string;
@@ -30,7 +157,11 @@ export function VariantSelector({
   if (!variants || variants.length <= 1) return null;
 
   const selectedKey =
-    (rule.parameters.selectedVariant as string) || variants[0].key;
+    (rule.parameters.selectedVariant as string) ||
+    pickRuleVariantDefaultKey(
+      variants,
+      rule.parameters.issueCategory as string | undefined
+    );
 
   const selectedVariant = variants.find((v) => v.key === selectedKey);
   const showFixedInput =

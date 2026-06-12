@@ -20,6 +20,8 @@ import {
   Sparkles,
 } from "lucide-react";
 import type { CleaningRule } from "@contracts/types";
+import type { DiffKind } from "@/lib/pipelineRunDiff";
+import { diffKindClassName, diffKindLabel } from "@/lib/pipelineRunDiff";
 import {
   actionLabels,
   getRuleCategoryLabel,
@@ -27,7 +29,7 @@ import {
   isCustomRule,
   getAdvancedRuleLabel,
 } from "./rulesShared";
-import { VariantSelector, FillNullParameterEditor } from "./RuleEditForm";
+import { VariantSelector, FillNullParameterEditor, InvalidActionParameterEditor, UnmatchedStrategyEditor } from "./RuleEditForm";
 
 const actionIcons: Record<string, React.ReactNode> = {
   dedup: <Eraser className="w-4 h-4" />,
@@ -43,12 +45,16 @@ const actionIcons: Record<string, React.ReactNode> = {
 
 export function RulesList({
   rules,
+  ruleDiffMap,
+  readOnly = false,
   onRuleStatusChange,
   onParameterChange,
   onDeleteCustomRule,
   emptyMessage,
 }: {
   rules: CleaningRule[];
+  ruleDiffMap?: Map<string, DiffKind>;
+  readOnly?: boolean;
   onRuleStatusChange: (ruleId: string, status: CleaningRule["status"]) => void;
   onParameterChange: (ruleId: string, params: Record<string, unknown>) => void;
   onDeleteCustomRule?: (ruleId: string) => void | Promise<void>;
@@ -78,10 +84,16 @@ export function RulesList({
           ) : (
             rules.map((rule) => {
               const custom = isCustomRule(rule);
+              const diffKey = rule.id || `${rule.field}:${rule.action}:${rule.index}`;
+              const diffKind = ruleDiffMap?.get(diffKey);
+              const diffRowClass =
+                diffKind && diffKind !== "unchanged"
+                  ? diffKindClassName(diffKind)
+                  : "";
               return (
                 <TableRow
                   key={rule.id}
-                  className={
+                  className={`${
                     rule.status === "skipped"
                       ? "opacity-50"
                       : rule.status === "confirmed"
@@ -89,11 +101,12 @@ export function RulesList({
                       : custom
                       ? "bg-sky-500/5"
                       : ""
-                  }
+                  } ${diffRowClass ? `border ${diffRowClass}` : ""}`}
                 >
                   <TableCell>
                     <Switch
                       checked={rule.status === "confirmed"}
+                      disabled={readOnly}
                       onCheckedChange={(checked) =>
                         onRuleStatusChange(rule.id, checked ? "confirmed" : "pending")
                       }
@@ -104,6 +117,11 @@ export function RulesList({
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-xs font-medium text-muted-foreground">{rule.id}</span>
                         <span className="text-sm font-medium">{rule.name}</span>
+                        {diffKind && diffKind !== "unchanged" && (
+                          <Badge variant="outline" className={`text-[10px] ${diffKindClassName(diffKind)}`}>
+                            {diffKindLabel(diffKind)}
+                          </Badge>
+                        )}
                         {getRuleCategoryLabel(rule) && (
                           <Badge variant="outline" className="text-[10px]">
                             {getRuleCategoryLabel(rule)}
@@ -131,6 +149,8 @@ export function RulesList({
                         !(Array.isArray(rule.parameters.variants) && rule.parameters.variants.length > 1) && (
                           <FillNullParameterEditor rule={rule} onParameterChange={onParameterChange} />
                         )}
+                      <InvalidActionParameterEditor rule={rule} onParameterChange={onParameterChange} />
+                      <UnmatchedStrategyEditor rule={rule} onParameterChange={onParameterChange} />
                     </div>
                   </TableCell>
                   <TableCell>

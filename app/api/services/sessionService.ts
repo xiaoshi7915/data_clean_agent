@@ -1,4 +1,4 @@
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, and } from "drizzle-orm";
 import { getDb } from "../queries/connection";
 import { cleanupSession } from "./dataSourceService";
 import {
@@ -9,9 +9,22 @@ import {
   cleaningRules,
   sqlSteps,
   executionLogs,
+  pipelineRuns,
 } from "@db/schema";
+import {
+  ensureInitialPipelineRun,
+  getCurrentRunIndex,
+  listPipelineRuns,
+  resolveRunIndex,
+  startNewPipelineRun,
+} from "./pipelineRunService";
 import { getDataSourceById, upsertDataSource, findDataSourceByConnection } from "./dataSourceStoreService";
+import { normalizeStoredUploadPath, toStoredUploadPath } from "./uploadPathService";
 import { sanitizeDataSourceForClient } from "../lib/dataSourceSanitizer";
+import { resolveSessionScope, assertCanBindTargetTable } from "../lib/sessionScope";
+import { buildConsolidatedCleaningSql } from "./sqlGenerationService";
+import { getLatestRevisionIndex } from "./pipelineSnapshotService";
+import { loadExecutionHistory } from "./executionPersistenceService";
 import type {
   CleaningPhase,
   DataSourceConfig,
@@ -80,7 +93,7 @@ async function buildDataSourceFromSession(
       fileName: row.fileName,
       fileSize: 0,
       fileType: (row.fileType as "csv" | "json" | "xml" | "xlsx") || "csv",
-      filePath: row.filePath || "",
+      filePath: row.filePath ? normalizeStoredUploadPath(row.filePath) : "",
     };
   }
 
@@ -129,10 +142,15 @@ export async function createSession(
     dbSchema: dataSource.dbConfig?.schema || null,
     fileName: dataSource.fileConfig?.fileName || null,
     fileType: dataSource.fileConfig?.fileType || null,
-    filePath: dataSource.fileConfig?.filePath || null,
+    filePath: dataSource.fileConfig?.filePath
+      ? toStoredUploadPath(dataSource.fileConfig.filePath)
+      : null,
     retryCount: 0,
+    currentRunIndex: 1,
     lastAction: "session_created",
   });
+
+  await ensureInitialPipelineRun(sessionId);
 
   return sessionId;
 }
@@ -153,9 +171,33 @@ export async function updateSessionTitle(sessionId: string, title: string): Prom
 
 export async function updateSessionTargetTable(sessionId: string, targetTable: string): Promise<void> {
   const db = getDb();
+  const rows = await db
+    .select()
+    .from(cleaningSessions)
+    .where(eq(cleaningSessions.sessionId, sessionId))
+    .limit(1);
+
+  if (rows.length === 0) {
+    throw new Error("会话不存在");
+  }
+
+  assertCanBindTargetTable(rows[0], targetTable);
+
   await db
     .update(cleaningSessions)
     .set({ targetTable, updatedAt: new Date() })
+    .where(eq(cleaningSessions.sessionId, sessionId));
+}
+
+/** 更新源表预过滤 WHERE 子句（不含 WHERE 关键字） */
+export async function updateSessionSourceWhere(
+  sessionId: string,
+  sourceWhereClause: string | null
+): Promise<void> {
+  const db = getDb();
+  await db
+    .update(cleaningSessions)
+    .set({ sourceWhereClause, updatedAt: new Date() })
     .where(eq(cleaningSessions.sessionId, sessionId));
 }
 
@@ -172,15 +214,19 @@ export async function getSession(sessionId: string): Promise<SessionState | null
   const row = rows[0];
   const dataSource = await buildDataSourceFromSession(row);
   const messages = await loadMessages(sessionId);
+  const sessionScope = resolveSessionScope(row);
 
   return {
     sessionId: row.sessionId,
     currentPhase: row.currentPhase as CleaningPhase,
     dataSource: sanitizeDataSourceForClient(dataSource),
+    sessionScope: sessionScope ?? undefined,
     targetTable: row.targetTable || undefined,
+    sourceWhereClause: row.sourceWhereClause || undefined,
     confirmedRules: [],
     lastAction: row.lastAction || "",
     retryCount: row.retryCount,
+    currentRunIndex: row.currentRunIndex ?? 1,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
     messages,
@@ -198,19 +244,21 @@ async function loadMessages(sessionId: string): Promise<ChatMessage[]> {
   return msgs.map((m) => {
     const metadata = (m.metadata as Record<string, unknown>) || undefined;
     const actions = metadata?.actions as ChatMessageAction[] | undefined;
+    const runIndex =
+      (metadata?.runIndex as number | undefined) ?? m.runIndex ?? 1;
     return {
       id: m.messageId,
       role: m.role as "agent" | "user" | "system",
       phase: m.phase as CleaningPhase,
       content: m.content,
       timestamp: m.createdAt.toISOString(),
-      metadata,
+      metadata: { ...metadata, runIndex },
       actions,
     };
   });
 }
 
-export async function getFullSession(sessionId: string) {
+export async function getFullSession(sessionId: string, runIndex?: number) {
   const base = await getSession(sessionId);
   if (!base) return null;
 
@@ -219,38 +267,69 @@ export async function getFullSession(sessionId: string) {
     await db.select().from(cleaningSessions).where(eq(cleaningSessions.sessionId, sessionId)).limit(1)
   )[0];
 
+  const effectiveRunIndex = await resolveRunIndex(sessionId, runIndex);
+  const pipelineRunsList = await listPipelineRuns(sessionId);
+
   const exploreRows = await db
     .select()
     .from(explorationResults)
-    .where(eq(explorationResults.sessionId, sessionId))
+    .where(
+      and(
+        eq(explorationResults.sessionId, sessionId),
+        eq(explorationResults.runIndex, effectiveRunIndex)
+      )
+    )
     .orderBy(desc(explorationResults.createdAt))
     .limit(1);
 
   const qualityRows = await db
     .select()
     .from(qualityReports)
-    .where(eq(qualityReports.sessionId, sessionId))
+    .where(
+      and(
+        eq(qualityReports.sessionId, sessionId),
+        eq(qualityReports.runIndex, effectiveRunIndex),
+        eq(qualityReports.phase, "before")
+      )
+    )
     .orderBy(desc(qualityReports.createdAt))
     .limit(1);
+
+  // 兼容无 phase 列或仅有 after 报告的历史数据
+  const qualityRow =
+    qualityRows[0] ??
+    (
+      await db
+        .select()
+        .from(qualityReports)
+        .where(
+          and(
+            eq(qualityReports.sessionId, sessionId),
+            eq(qualityReports.runIndex, effectiveRunIndex)
+          )
+        )
+        .orderBy(desc(qualityReports.createdAt))
+        .limit(1)
+    )[0];
 
   const ruleRows = await db
     .select()
     .from(cleaningRules)
-    .where(eq(cleaningRules.sessionId, sessionId))
+    .where(
+      and(
+        eq(cleaningRules.sessionId, sessionId),
+        eq(cleaningRules.runIndex, effectiveRunIndex)
+      )
+    )
     .orderBy(cleaningRules.ruleIndex);
 
   const stepRows = await db
     .select()
     .from(sqlSteps)
-    .where(eq(sqlSteps.sessionId, sessionId))
+    .where(
+      and(eq(sqlSteps.sessionId, sessionId), eq(sqlSteps.runIndex, effectiveRunIndex))
+    )
     .orderBy(sqlSteps.stepNumber);
-
-  const execRows = await db
-    .select()
-    .from(executionLogs)
-    .where(eq(executionLogs.sessionId, sessionId))
-    .orderBy(desc(executionLogs.createdAt))
-    .limit(1);
 
   let explorationResult: ExplorationResult | undefined;
   if (exploreRows[0]) {
@@ -269,8 +348,8 @@ export async function getFullSession(sessionId: string) {
   }
 
   let qualityReport: QualityReport | undefined;
-  if (qualityRows[0]) {
-    const q = qualityRows[0];
+  if (qualityRow) {
+    const q = qualityRow;
     qualityReport = {
       score: {
         overall: q.overallScore,
@@ -320,22 +399,22 @@ export async function getFullSession(sessionId: string) {
 
     const sourceTable =
       base.targetTable || base.dataSource.fileConfig?.fileName.replace(/\.[^.]+$/, "") || "data";
-    const insertStep = stepRows.find((s) => s.operationType === "INSERT");
+    const mappedSteps = stepRows.map((s) => ({
+      stepNumber: s.stepNumber,
+      name: s.name,
+      operationType: s.operationType,
+      sql: s.sql,
+      rollbackSql: s.rollbackSql || undefined,
+      affectedRows: s.affectedRows,
+      estimatedTime: s.estimatedTime || undefined,
+      riskLevel: s.riskLevel,
+    }));
     generatedSQL = {
       targetDialect: dialect,
       targetTable: `${sourceTable}_cleaned`,
       targetDatabase: base.dataSource.dbConfig?.database || "default",
-      steps: stepRows.map((s) => ({
-        stepNumber: s.stepNumber,
-        name: s.name,
-        operationType: s.operationType,
-        sql: s.sql,
-        rollbackSql: s.rollbackSql || undefined,
-        affectedRows: s.affectedRows,
-        estimatedTime: s.estimatedTime || undefined,
-        riskLevel: s.riskLevel,
-      })),
-      consolidatedSql: insertStep?.sql || "",
+      steps: mappedSteps,
+      consolidatedSql: buildConsolidatedCleaningSql(mappedSteps),
       backupSql: stepRows[0]?.sql || "",
       rollbackSql: "",
       totalAffectedRows: stepRows.reduce((sum, s) => sum + s.affectedRows, 0),
@@ -343,30 +422,27 @@ export async function getFullSession(sessionId: string) {
   }
 
   let executionResult: ExecutionResult | undefined;
-  if (execRows[0]) {
-    const x = execRows[0];
-    executionResult = {
-      executionId: x.executionId,
-      overallStatus: x.overallStatus,
-      stepResults: (x.stepResults as ExecutionResult["stepResults"]) || [],
-      metricsBefore: x.metricsBefore as ExecutionResult["metricsBefore"],
-      metricsAfter: x.metricsAfter as ExecutionResult["metricsAfter"],
-      backupTableName: x.backupTableName || undefined,
-      startedAt: x.startedAt.toISOString(),
-      completedAt: x.completedAt?.toISOString(),
-      error: x.error || undefined,
-    };
+  const executionHistory = await loadExecutionHistory(sessionId, effectiveRunIndex, 10);
+  if (executionHistory[0]) {
+    executionResult = executionHistory[0];
   }
+
+  const latestRevisionIndex = await getLatestRevisionIndex(sessionId, effectiveRunIndex);
 
   return {
     ...base,
     dataSourceId: row?.dataSourceId || undefined,
     sessionTitle: row?.sessionTitle || undefined,
+    currentRunIndex: row?.currentRunIndex ?? 1,
+    viewingRunIndex: effectiveRunIndex,
+    latestRevisionIndex,
+    pipelineRuns: pipelineRunsList,
     explorationResult,
     qualityReport,
     cleaningRules: cleaningRulesList,
     generatedSQL,
     executionResult,
+    executionHistory,
   };
 }
 
@@ -384,6 +460,19 @@ export async function updateSessionPhase(
       updatedAt: new Date(),
     })
     .where(eq(cleaningSessions.sessionId, sessionId));
+}
+
+/** 在当前会话内开始新一轮流水线（保留历史，不删除旧 run 数据） */
+export async function resetSessionPipeline(
+  sessionId: string
+): Promise<{ success: boolean; runIndex?: number; retryCount?: number }> {
+  const started = await startNewPipelineRun(sessionId);
+  if (!started) return { success: false };
+  return {
+    success: true,
+    runIndex: started.runIndex,
+    retryCount: started.retryCount,
+  };
 }
 
 export async function incrementRetryCount(sessionId: string): Promise<number> {
@@ -404,13 +493,16 @@ export async function incrementRetryCount(sessionId: string): Promise<number> {
 
 export async function addMessage(sessionId: string, message: ChatMessage): Promise<void> {
   const db = getDb();
+  const runIndex = await getCurrentRunIndex(sessionId);
   const metadata = {
     ...(message.metadata || {}),
     ...(message.actions ? { actions: message.actions } : {}),
+    runIndex,
   };
 
   await db.insert(chatMessages).values({
     sessionId,
+    runIndex,
     messageId: message.id,
     role: message.role,
     phase: message.phase,
@@ -473,6 +565,7 @@ export async function deleteSession(sessionId: string): Promise<boolean> {
   await db.delete(cleaningRules).where(eq(cleaningRules.sessionId, sessionId));
   await db.delete(sqlSteps).where(eq(sqlSteps.sessionId, sessionId));
   await db.delete(executionLogs).where(eq(executionLogs.sessionId, sessionId));
+  await db.delete(pipelineRuns).where(eq(pipelineRuns.sessionId, sessionId));
   await db.delete(cleaningSessions).where(eq(cleaningSessions.sessionId, sessionId));
 
   await cleanupSession(sessionId);

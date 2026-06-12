@@ -27,7 +27,8 @@ export async function runExploration(
   sessionId: string,
   dataSource: NonNullable<CleaningSessionState["dataSource"]>,
   tableName: string | undefined,
-  mutations: ExploreMutations
+  mutations: ExploreMutations,
+  runIndex?: number
 ): Promise<{ exploration: ExplorationResult; resolvedTable: string }> {
   const isDbSource = isDbSourceType(dataSource.type);
   let resolvedTable = tableName?.trim() || "";
@@ -41,6 +42,7 @@ export async function runExploration(
     }
     const exploreResult = await mutations.exploreDb.mutateAsync({
       sessionId,
+      runIndex,
       config: dataSource.dbConfig,
       tableName: resolvedTable,
       limit: 100,
@@ -55,6 +57,7 @@ export async function runExploration(
   if (dataSource.fileConfig) {
     const exploreResult = await mutations.exploreFile.mutateAsync({
       sessionId,
+      runIndex,
       filePath: dataSource.fileConfig.filePath,
       fileType: dataSource.fileConfig.fileType,
       previewRows: 100,

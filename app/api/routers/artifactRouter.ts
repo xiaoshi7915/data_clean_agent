@@ -16,7 +16,7 @@ export const artifactRouter = createRouter({
     allowExecute: env.allowExecute,
   })),
 
-  /** 导出脚本包（JSON 文件列表 + 内容，供 UI/CLI 下载） */
+  /** 导出脚本包（文件列表 + 内容；asZip=true 时额外返回 zipBase64 供 UI 下载） */
   exportBundle: protectedMutation
     .input(
       z.object({

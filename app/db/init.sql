@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS `cleaning_sessions` (
   `file_name` varchar(255) NULL,
   `file_type` enum('csv','json','xml','xlsx') NULL,
   `file_path` varchar(500) NULL,
-  `retry_count` int NOT NULL DEFAULT 0,
+  `  retry_count` int NOT NULL DEFAULT 0,
+  `current_run_index` int NOT NULL DEFAULT 1,
   `last_action` varchar(100) NULL,
   `contract_yaml` text NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -46,6 +47,7 @@ CREATE TABLE IF NOT EXISTS `cleaning_sessions` (
 CREATE TABLE IF NOT EXISTS `exploration_results` (
   `id` int NOT NULL AUTO_INCREMENT,
   `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL DEFAULT 1,
   `source_type` varchar(50) NOT NULL,
   `source_name` varchar(255) NOT NULL,
   `total_rows` int NOT NULL,
@@ -61,6 +63,8 @@ CREATE TABLE IF NOT EXISTS `exploration_results` (
 CREATE TABLE IF NOT EXISTS `quality_reports` (
   `id` int NOT NULL AUTO_INCREMENT,
   `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL DEFAULT 1,
+  `phase` enum('before','after') NOT NULL DEFAULT 'before',
   `overall_score` int NOT NULL,
   `completeness_score` int NOT NULL,
   `uniqueness_score` int NOT NULL,
@@ -78,6 +82,7 @@ CREATE TABLE IF NOT EXISTS `quality_reports` (
 CREATE TABLE IF NOT EXISTS `cleaning_rules` (
   `id` int NOT NULL AUTO_INCREMENT,
   `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL DEFAULT 1,
   `rule_id` varchar(50) NOT NULL,
   `rule_index` int NOT NULL,
   `name` varchar(255) NOT NULL,
@@ -99,6 +104,7 @@ CREATE TABLE IF NOT EXISTS `cleaning_rules` (
 CREATE TABLE IF NOT EXISTS `sql_steps` (
   `id` int NOT NULL AUTO_INCREMENT,
   `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL DEFAULT 1,
   `step_number` int NOT NULL,
   `name` varchar(255) NOT NULL,
   `operation_type` enum('CREATE','UPDATE','DELETE','INSERT','SELECT') NOT NULL,
@@ -114,6 +120,7 @@ CREATE TABLE IF NOT EXISTS `sql_steps` (
 CREATE TABLE IF NOT EXISTS `execution_logs` (
   `id` int NOT NULL AUTO_INCREMENT,
   `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL DEFAULT 1,
   `execution_id` varchar(64) NOT NULL,
   `overall_status` enum('pending','running','success','failed','partial') NOT NULL,
   `step_results` json NULL,
@@ -130,6 +137,7 @@ CREATE TABLE IF NOT EXISTS `execution_logs` (
 CREATE TABLE IF NOT EXISTS `chat_messages` (
   `id` int NOT NULL AUTO_INCREMENT,
   `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL DEFAULT 1,
   `message_id` varchar(64) NOT NULL,
   `role` enum('agent','user','system') NOT NULL,
   `phase` enum('idle','explore','analyze','confirm','generate','execute','retry') NOT NULL DEFAULT 'idle',
@@ -137,6 +145,28 @@ CREATE TABLE IF NOT EXISTS `chat_messages` (
   `metadata` json NULL,
   `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`)
+);
+
+CREATE TABLE IF NOT EXISTS `pipeline_snapshots` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL DEFAULT 1,
+  `revision_index` int NOT NULL,
+  `trigger` varchar(64) DEFAULT NULL,
+  `rules` json NOT NULL,
+  `generated_sql` json DEFAULT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `pipeline_snapshots_session_run_revision` (`session_id`, `run_index`, `revision_index`)
+);
+
+CREATE TABLE IF NOT EXISTS `pipeline_runs` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `session_id` varchar(64) NOT NULL,
+  `run_index` int NOT NULL,
+  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `pipeline_runs_session_run` (`session_id`, `run_index`)
 );
 
 CREATE TABLE IF NOT EXISTS `file_uploads` (

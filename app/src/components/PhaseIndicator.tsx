@@ -14,7 +14,7 @@ interface PhaseIndicatorProps {
   completedPhases: CleaningPhase[];
   /** 点击已完成或当前阶段时回调（用于打开对应面板） */
   onPhaseClick?: (phase: CleaningPhase) => void;
-  /** 点击「重试」时回调（重新开始选表流程） */
+  /** 点击「重试」时回调（在当前会话内重置流程） */
   onRetryClick?: () => void;
 }
 
@@ -109,7 +109,7 @@ export function PhaseIndicator({
                 }
               : undefined
           }
-          title={onRetryClick ? "重新开始选表流程" : undefined}
+          title={onRetryClick ? "在本对话中重置清洗流程" : undefined}
           className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive ${
             onRetryClick
               ? "cursor-pointer hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"

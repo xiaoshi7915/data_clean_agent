@@ -7,16 +7,20 @@ import {
   updateSessionPhase,
   updateSessionTitle,
   updateSessionTargetTable,
+  updateSessionSourceWhere,
   addMessage,
   listSessions,
   listSessionsByDataSource,
   deleteSession,
+  resetSessionPipeline,
 } from "../services/sessionService";
+import { listPipelineRuns } from "../services/pipelineRunService";
 import {
   listSavedDataSources,
   getDataSourceById,
   updateDataSource,
   upsertDataSource,
+  softDeleteDataSource,
 } from "../services/dataSourceStoreService";
 import { sanitizeDataSourceForClient } from "../lib/dataSourceSanitizer";
 
@@ -130,9 +134,14 @@ export const sessionRouter = createRouter({
     }),
 
   getFull: protectedQuery
-    .input(z.object({ sessionId: z.string() }))
+    .input(
+      z.object({
+        sessionId: z.string(),
+        runIndex: z.number().int().positive().optional(),
+      })
+    )
     .query(async ({ input }) => {
-      const session = await getFullSession(input.sessionId);
+      const session = await getFullSession(input.sessionId, input.runIndex);
       return { session, found: !!session };
     }),
 
@@ -149,6 +158,25 @@ export const sessionRouter = createRouter({
       return { success: true };
     }),
 
+  resetPipeline: protectedMutation
+    .input(z.object({ sessionId: z.string() }))
+    .mutation(async ({ input }) => {
+      const reset = await resetSessionPipeline(input.sessionId);
+      return {
+        success: reset.success,
+        runIndex: reset.runIndex,
+        retryCount: reset.retryCount,
+        error: reset.success ? undefined : "会话不存在",
+      };
+    }),
+
+  listPipelineRuns: protectedQuery
+    .input(z.object({ sessionId: z.string() }))
+    .query(async ({ input }) => {
+      const runs = await listPipelineRuns(input.sessionId);
+      return { runs };
+    }),
+
   updateTitle: protectedMutation
     .input(z.object({ sessionId: z.string(), title: z.string() }))
     .mutation(async ({ input }) => {
@@ -159,7 +187,24 @@ export const sessionRouter = createRouter({
   updateTargetTable: protectedMutation
     .input(z.object({ sessionId: z.string(), targetTable: z.string() }))
     .mutation(async ({ input }) => {
-      await updateSessionTargetTable(input.sessionId, input.targetTable);
+      try {
+        await updateSessionTargetTable(input.sessionId, input.targetTable);
+        return { success: true as const };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "更新目标表失败";
+        return { success: false as const, error: message };
+      }
+    }),
+
+  updateSourceWhere: protectedMutation
+    .input(
+      z.object({
+        sessionId: z.string(),
+        sourceWhereClause: z.string().nullable(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      await updateSessionSourceWhere(input.sessionId, input.sourceWhereClause);
       return { success: true };
     }),
 
@@ -209,6 +254,13 @@ export const sessionRouter = createRouter({
     .mutation(async ({ input }) => {
       const updated = await updateDataSource(input.dataSourceId, input.dataSource);
       return { success: updated, error: updated ? undefined : "数据源不存在" };
+    }),
+
+  deleteDataSource: protectedMutation
+    .input(z.object({ dataSourceId: z.string() }))
+    .mutation(async ({ input }) => {
+      const deleted = await softDeleteDataSource(input.dataSourceId);
+      return { success: deleted, error: deleted ? undefined : "数据源不存在或已删除" };
     }),
 
   delete: protectedMutation

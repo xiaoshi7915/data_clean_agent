@@ -10,6 +10,9 @@ import type {
 import { PLACEHOLDER_NULL_VALUES, type RuleQualityCategory } from "./cleaningActionRegistry";
 import { isPlaceholderNullValue } from "@contracts/cleaningConstants";
 import { metricRegistry } from "../../engine/metrics/metricRegistry";
+import { has15DigitIdCardSamples } from "../lib/idCardTransform";
+import { detectSourceFormats } from "../lib/dateFormatRules";
+import { detectFullwidthPairs } from "../lib/textFormatRules";
 /** 复用探查阶段的 nullCount，避免从 nullRate 反算产生舍入误差 */
 function getNonNullCount(column: ColumnStats, totalRows: number): number {
   const nullCount =
@@ -419,6 +422,25 @@ export interface RuleVariantOption {
   riskNote?: string;
 }
 
+/** 「空值过多」规则默认变体：填充 NULL，而非删除行 */
+export const NULL_ISSUE_DEFAULT_VARIANT_KEY = "null_literal";
+
+/** 分组规则未显式选中变体时，按问题类型选取默认策略 */
+export function pickRuleVariantDefaultKey(
+  variants: RuleVariantOption[],
+  issueCategory?: string
+): string {
+  if (issueCategory === "空值过多") {
+    const nullLiteral = variants.find((v) => v.key === NULL_ISSUE_DEFAULT_VARIANT_KEY);
+    if (nullLiteral) return nullLiteral.key;
+    const fillNull = variants.find((v) => v.action === "fill_null");
+    if (fillNull) return fillNull.key;
+  }
+  const recommended = variants.find((v) => v.parameters?.recommended);
+  if (recommended) return recommended.key;
+  return variants[0]?.key ?? "";
+}
+
 /** 将分组规则解析为当前选中变体对应的有效规则（SQL 生成时使用） */
 export function resolveRuleVariant(rule: CleaningRule): CleaningRule {
   const variants = rule.parameters.variants as RuleVariantOption[] | undefined;
@@ -426,20 +448,28 @@ export function resolveRuleVariant(rule: CleaningRule): CleaningRule {
     return rule;
   }
 
+  const issueCategory = rule.parameters.issueCategory as string | undefined;
   const selectedKey =
-    (rule.parameters.selectedVariant as string) || variants[0]?.key;
+    (rule.parameters.selectedVariant as string) ||
+    pickRuleVariantDefaultKey(variants, issueCategory);
   const selected =
-    variants.find((v) => v.key === selectedKey) || variants[0];
+    variants.find((v) => v.key === selectedKey) ||
+    variants.find((v) => v.key === pickRuleVariantDefaultKey(variants, issueCategory)) ||
+    variants[0];
+
+  // NL / UI 修改的参数（如 fillValue、replaceAll）应覆盖变体默认值
+  const {
+    variants: _variants,
+    selectedVariant: _selectedVariant,
+    issueCategory: _issueCategory,
+    ...userOverrides
+  } = rule.parameters;
 
   return {
     ...rule,
-    action: selected.action,
-    name: selected.name || rule.name,
-    strategy: selected.strategy || rule.strategy,
-    riskLevel: selected.riskLevel || rule.riskLevel,
-    riskNote: selected.riskNote || rule.riskNote,
     parameters: {
       ...selected.parameters,
+      ...userOverrides,
       issueCategory: rule.parameters.issueCategory,
       selectedVariant: selected.key,
       variants,
@@ -515,18 +545,6 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
     const isEmail = columnNameMatches(column, ["email", "mail"]);
     const defaultFill = isEmail ? "unknown@example.com" : isNumeric ? 0 : "UNKNOWN";
     const variants: RuleVariantOption[] = [];
-
-    if (includeRemove) {
-      variants.push({
-        key: "remove",
-        action: "remove",
-        name: `删除空值行 - ${column}`,
-        strategy: `删除「${column}」为空的行（空值率 ${issue.affectedPercent}%）`,
-        parameters: { condition: "IS NULL", variant: "remove" },
-        riskLevel: "high",
-        riskNote: `将删除 ${issue.affectedRows} 行数据，请确认是否可接受`,
-      });
-    }
 
     variants.push(
       {
@@ -617,20 +635,33 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
     }
 
     variants.push({
-      key: "null_literal",
+      key: NULL_ISSUE_DEFAULT_VARIANT_KEY,
       action: "fill_null",
       name: `空值填充(NULL) - ${column}`,
       strategy: `将「${column}」空值及空字符串统一保留/填充为 SQL NULL`,
       parameters: {
         strategy: "fixed",
         fillValue: "NULL",
-        variant: "null_literal",
+        variant: NULL_ISSUE_DEFAULT_VARIANT_KEY,
         treatEmptyAsNull: true,
         recommended: true,
       },
       riskLevel: "low",
       riskNote: "显式 NULL 便于下游统计区分缺失值",
     });
+
+    // 删除行作为可选变体，不作为默认推荐（高空值率场景优先填充 NULL）
+    if (includeRemove) {
+      variants.push({
+        key: "remove",
+        action: "remove",
+        name: `删除空值行 - ${column}`,
+        strategy: `删除「${column}」为空的行（空值率 ${issue.affectedPercent}%）`,
+        parameters: { condition: "IS NULL", variant: "remove" },
+        riskLevel: "high",
+        riskNote: `将删除 ${issue.affectedRows} 行数据，请确认是否可接受`,
+      });
+    }
 
     return variants;
   };
@@ -702,10 +733,7 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
     const colStats = exploration.columnStats.find((cs) => cs.columnName === issue.column);
     const includeRemove = issue.affectedPercent >= 50;
     const variants = buildNullFillVariants(issue.column, issue, colStats, includeRemove);
-    const defaultKey =
-      includeRemove
-        ? "remove"
-        : variants.find((v) => v.parameters.recommended)?.key || "fixed";
+    const defaultKey = pickRuleVariantDefaultKey(variants, "空值过多");
 
     addGroupedRule(issue.column, "空值过多", {
       issueDescription: issue.description,
@@ -891,6 +919,7 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
     if (isDateLike && sampleStrs.length > 0) {
       const invalidDates = sampleStrs.filter((v) => Number.isNaN(new Date(v).getTime()));
       if (invalidDates.length > 0 || sampleStrs.some((v) => !/^\d{4}-\d{2}-\d{2}/.test(v))) {
+        const sourceFormats = detectSourceFormats(sampleStrs);
         addRule({
           name: `日期格式标准化 - ${cs.columnName}`,
           field: cs.columnName,
@@ -899,7 +928,7 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
           strategy: "解析并统一为 ISO 日期格式 (YYYY-MM-DD)",
           affectedRows: nonNullCount,
           affectedPercent: parseFloat((100 - cs.nullRate).toFixed(2)),
-          parameters: { format: "DATE_ISO", recommended: true },
+          parameters: { format: "DATE_ISO", sourceFormats, recommended: true },
           status: "pending",
           riskLevel: "medium",
           riskNote: "无法解析的日期将置为 NULL",
@@ -1011,17 +1040,35 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
           riskLevel: "low",
         });
       }
-      const hasFullWidth = sampleStrs.some((v) => /[\uFF01-\uFF5E]/.test(v));
-      if (hasFullWidth) {
+      const fullwidthSamples = sampleStrs.filter((v) => /[\uFF01-\uFF5E\u3000]/.test(v));
+      if (fullwidthSamples.length > 0) {
+        const detectedPairs = detectFullwidthPairs(fullwidthSamples);
+        const sampleHitCount = fullwidthSamples.length;
+        const affectedPercent =
+          sampleStrs.length > 0
+            ? parseFloat(((sampleHitCount / sampleStrs.length) * 100).toFixed(2))
+            : 0;
+        const pairPreview = detectedPairs
+          .slice(0, 5)
+          .map((p) => `${p.from}→${p.to}`)
+          .join("、");
         addRule({
           name: `全角转半角 - ${cs.columnName}`,
           field: cs.columnName,
           action: "format" as CleaningAction,
-          issueDescription: `列 "${cs.columnName}" 含有全角字符`,
-          strategy: "将全角字母数字转为半角",
-          affectedRows: nonNullCount,
-          affectedPercent: parseFloat((100 - cs.nullRate).toFixed(2)),
-          parameters: withCategory({ format: "FULLWIDTH", recommended: true }, "text"),
+          issueDescription: `列 "${cs.columnName}" 样本中检测到全角字符（触发条件：探查样本含全角字母/数字/标点或全角空格）`,
+          strategy: `将全角字符转为半角；样本命中 ${sampleHitCount}/${sampleStrs.length} 条${pairPreview ? `，如 ${pairPreview}` : ""}`,
+          affectedRows: Math.max(1, Math.round((nonNullCount * sampleHitCount) / Math.max(sampleStrs.length, 1))),
+          affectedPercent,
+          parameters: withCategory(
+            {
+              format: "FULLWIDTH",
+              recommended: true,
+              detectedPairs,
+              triggerHint: "探查样本中出现全角字符（\\uFF01-\\uFF5E 或全角空格）时推荐",
+            },
+            "text"
+          ),
           status: "pending",
           riskLevel: "low",
         });
@@ -1148,6 +1195,37 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
       });
     }
     if (columnNameMatches(colLower, ["idcard", "身份证", "id_no", "identity"])) {
+      if (has15DigitIdCardSamples(sampleStrs)) {
+        addRule({
+          name: `身份证升位转换 - ${cs.columnName}`,
+          field: cs.columnName,
+          action: "standardize" as CleaningAction,
+          issueDescription: `列 "${cs.columnName}" 存在 15 位旧版身份证号，需升 18 位`,
+          strategy: "15 位升 18 位并校验校验位（GB 11643）",
+          affectedRows: Math.max(
+            1,
+            Math.round(
+              (sampleStrs.filter((v) => /^\d{15}$/.test(v.trim())).length /
+                Math.max(sampleStrs.length, 1)) *
+                nonNullCount
+            )
+          ),
+          affectedPercent: parseFloat(
+            (
+              (sampleStrs.filter((v) => /^\d{15}$/.test(v.trim())).length /
+                Math.max(sampleStrs.length, 1)) *
+              100
+            ).toFixed(2)
+          ),
+          parameters: withCategory(
+            { type: "id_card_transform", invalidAction: "null", recommended: true },
+            "validity"
+          ),
+          status: "pending",
+          riskLevel: "medium",
+          riskNote: "无法升位或校验失败的证件号将按 invalidAction 处理",
+        });
+      }
       addRule({
         name: `身份证长度校验(18位) - ${cs.columnName}`,
         field: cs.columnName,
@@ -1156,7 +1234,10 @@ export function generateCleaningRules(exploration: ExplorationResult, report: Qu
         strategy: "非 18 位证件号置为 NULL",
         affectedRows: nonNullCount,
         affectedPercent: parseFloat((100 - cs.nullRate).toFixed(2)),
-        parameters: withCategory({ type: "length_validate", expectedLength: 18, recommended: true }, "validity"),
+        parameters: withCategory(
+          { type: "length_validate", expectedLength: 18, invalidAction: "null", recommended: true },
+          "validity"
+        ),
         status: "pending",
         riskLevel: "medium",
       });

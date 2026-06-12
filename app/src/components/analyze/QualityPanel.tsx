@@ -21,14 +21,16 @@ import {
   FileCheck,
 } from "lucide-react";
 import type { QualityReport } from "@contracts/types";
+import type { ScoreDiffEntry } from "@/lib/pipelineRunDiff";
 
 interface QualityPanelProps {
   report: QualityReport;
+  scoreDiff?: ScoreDiffEntry[];
   onConfirmAll: () => void;
   onAdjust: () => void;
 }
 
-export function QualityPanel({ report }: QualityPanelProps) {
+export function QualityPanel({ report, scoreDiff }: QualityPanelProps) {
   const { score, highPriorityIssues, mediumPriorityIssues, lowPriorityIssues, summary } = report;
 
   const getScoreColor = (value: number) => {
@@ -51,6 +53,8 @@ export function QualityPanel({ report }: QualityPanelProps) {
     if (value >= 50) return "一般";
     return "较差";
   };
+
+  const scoreDeltaMap = new Map((scoreDiff ?? []).map((s) => [s.label, s.delta]));
 
   return (
     <div className="space-y-4 min-w-0 py-4">
@@ -116,7 +120,21 @@ export function QualityPanel({ report }: QualityPanelProps) {
                 {dim.icon}
                 <span className="text-[11px] text-muted-foreground truncate">{dim.label}</span>
               </div>
-              <p className={`text-lg font-bold ${getScoreColor(dim.value)}`}>{dim.value}</p>
+              <p className={`text-lg font-bold ${getScoreColor(dim.value)}`}>
+                {dim.value}
+                {scoreDeltaMap.has(dim.label) && scoreDeltaMap.get(dim.label) !== 0 && (
+                  <span
+                    className={`ml-1 text-[10px] font-medium ${
+                      (scoreDeltaMap.get(dim.label) ?? 0) > 0
+                        ? "text-emerald-600"
+                        : "text-destructive"
+                    }`}
+                  >
+                    {(scoreDeltaMap.get(dim.label) ?? 0) > 0 ? "+" : ""}
+                    {scoreDeltaMap.get(dim.label)}
+                  </span>
+                )}
+              </p>
               <Progress value={dim.value} className="h-1.5 mt-2" />
             </CardContent>
           </Card>

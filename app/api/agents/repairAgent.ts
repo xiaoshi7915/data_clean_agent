@@ -10,6 +10,7 @@ export function runRepairAgent(
     tableName: string;
     databaseName: string;
     columns?: string[];
+    sourceWhereClause?: string;
   }
 ): AgentOutput<RepairAgentOutput> {
   try {
@@ -19,7 +20,11 @@ export function runRepairAgent(
       input.dialect,
       input.tableName,
       input.databaseName,
-      input.columns ?? []
+      input.columns ?? [],
+      {
+        sourceWhereClause: input.sourceWhereClause,
+        emitProblemTable: true,
+      }
     );
     return { success: true, data: { sqlResult } };
   } catch (error) {

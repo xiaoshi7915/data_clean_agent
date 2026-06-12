@@ -4,12 +4,14 @@ import { createRouter, protectedMutation } from "../middleware";
 import { validateSQL } from "../services/sqlGenerationService";
 import { runRepairAgent } from "../agents/repairAgent";
 import { runVerifyAgent } from "../agents/verifyAgent";
-import { updateSessionPhase } from "../services/sessionService";
+import { updateSessionPhase, getSession } from "../services/sessionService";
 import { resolveDbConfigInput } from "../services/sessionCredentialService";
-import { validatePhaseTransition, PhaseValidationError } from "../services/phaseValidator";
+import { validatePhaseTransition, PhaseValidationError, HistoricalRunWriteError } from "../services/phaseValidator";
 import { getDb } from "../queries/connection";
 import { sqlSteps } from "@db/schema";
 import { isSqlDialectSupported, unsupportedDialectMessage } from "@contracts/dataSourceSupport";
+import { getCurrentRunIndex, assertWritableRun } from "../services/pipelineRunService";
+import { loadRulesForSessionRun } from "../services/rulesLoadService";
 
 const sqlStepSchema = z.object({
   stepNumber: z.number(),
@@ -36,6 +38,7 @@ export const sqlRouter = createRouter({
     .input(
       z.object({
         sessionId: z.string(),
+        runIndex: z.number().int().positive().optional(),
         rules: z.array(
           z.object({
             id: z.string(),
@@ -75,30 +78,44 @@ export const sqlRouter = createRouter({
         if (!isSqlDialectSupported(input.dialect)) {
           return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
-        await validatePhaseTransition(input.sessionId, "generate");
+        await validatePhaseTransition(input.sessionId, "generate", input.runIndex);
+        const runIndex = input.runIndex ?? (await getCurrentRunIndex(input.sessionId));
+        const dbRules = await loadRulesForSessionRun(input.sessionId, runIndex);
+        const rulesSource =
+          dbRules.length > 0
+            ? dbRules
+            : input.rules.map((r) => ({
+                ...r,
+                issueDescription: r.issueDescription ?? "",
+                strategy: r.strategy ?? "",
+                parameters: r.parameters ?? {},
+              }));
         const agentResult = runRepairAgent({
           sessionId: input.sessionId,
-          rules: input.rules.map((r) => ({
-            ...r,
-            issueDescription: r.issueDescription ?? "",
-            strategy: r.strategy ?? "",
-            parameters: r.parameters ?? {},
-          })),
+          rules: rulesSource,
           dialect: input.dialect,
           tableName: input.tableName,
           databaseName: input.databaseName,
           columns: input.columns ?? [],
+          sourceWhereClause: (await getSession(input.sessionId))?.sourceWhereClause,
         });
         if (!agentResult.success || !agentResult.data) {
           return { success: false, error: agentResult.error ?? "SQL生成失败", result: null };
         }
         const result = agentResult.data.sqlResult;
 
-        // Save SQL steps to DB
+        // 当前 run 内重新生成时替换旧步骤
         const db = getDb();
+        await db
+          .delete(sqlSteps)
+          .where(
+            and(eq(sqlSteps.sessionId, input.sessionId), eq(sqlSteps.runIndex, runIndex))
+          );
+
         for (const step of result.steps) {
           await db.insert(sqlSteps).values({
             sessionId: input.sessionId,
+            runIndex,
             stepNumber: step.stepNumber,
             name: step.name,
             operationType: step.operationType,
@@ -115,7 +132,7 @@ export const sqlRouter = createRouter({
         return { success: true, result };
       } catch (error) {
         const message =
-          error instanceof PhaseValidationError
+          error instanceof PhaseValidationError || error instanceof HistoricalRunWriteError
             ? error.message
             : error instanceof Error
             ? error.message
@@ -184,21 +201,35 @@ export const sqlRouter = createRouter({
     .input(
       z.object({
         sessionId: z.string(),
+        runIndex: z.number().int().positive().optional(),
         stepNumber: z.number(),
         newSql: z.string(),
       })
     )
     .mutation(async ({ input }) => {
-      const db = getDb();
-      await db
-        .update(sqlSteps)
-        .set({ sql: input.newSql })
-        .where(
-          and(
-            eq(sqlSteps.sessionId, input.sessionId),
-            eq(sqlSteps.stepNumber, input.stepNumber)
-          )
-        );
-      return { success: true };
+      try {
+        await assertWritableRun(input.sessionId, input.runIndex);
+        const db = getDb();
+        const runIndex = await getCurrentRunIndex(input.sessionId);
+        await db
+          .update(sqlSteps)
+          .set({ sql: input.newSql })
+          .where(
+            and(
+              eq(sqlSteps.sessionId, input.sessionId),
+              eq(sqlSteps.runIndex, runIndex),
+              eq(sqlSteps.stepNumber, input.stepNumber)
+            )
+          );
+        return { success: true };
+      } catch (error) {
+        const message =
+          error instanceof HistoricalRunWriteError
+            ? error.message
+            : error instanceof Error
+            ? error.message
+            : String(error);
+        return { success: false, error: message };
+      }
     }),
 });

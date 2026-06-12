@@ -8,6 +8,7 @@ export const RULE_CATEGORY_LABELS: Record<RuleQualityCategory, string> = {
   validity: "有效性",
   text: "文本",
   document: "文档",
+  filter: "过滤",
   skeleton: "骨架",
   metrics: "质量指标",
 };

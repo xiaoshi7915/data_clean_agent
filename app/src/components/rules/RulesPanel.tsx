@@ -5,6 +5,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { ListChecks, ArrowRight, FileCode2, Wand2, PenLine } from "lucide-react";
 import type { CleaningRule } from "@contracts/types";
+import type { RuleDiffEntry } from "@/lib/pipelineRunDiff";
 import { isCustomRule } from "./rulesShared";
 import { RulesToolbar } from "./RulesToolbar";
 import { RulesList } from "./RulesList";
@@ -30,6 +31,8 @@ interface RulesPanelProps {
   isLoading: boolean;
   embedded?: boolean;
   hideFooter?: boolean;
+  readOnly?: boolean;
+  ruleDiff?: RuleDiffEntry[];
 }
 
 /** 规则面板组合壳：工具栏 + 自动规则列表 + 自定义规则区 */
@@ -48,7 +51,10 @@ export function RulesPanel({
   isLoading,
   embedded,
   hideFooter,
+  readOnly = false,
+  ruleDiff,
 }: RulesPanelProps) {
+  const ruleDiffMap = new Map((ruleDiff ?? []).map((r) => [r.key, r.kind]));
   const confirmedCount = rules.filter((r) => r.status === "confirmed").length;
   const skippedCount = rules.filter((r) => r.status === "skipped").length;
   const pendingCount = rules.filter((r) => r.status === "pending").length;
@@ -74,6 +80,8 @@ export function RulesPanel({
         </div>
         <RulesList
           rules={autoRules}
+          ruleDiffMap={ruleDiffMap}
+          readOnly={readOnly}
           onRuleStatusChange={onRuleStatusChange}
           onParameterChange={onParameterChange}
           emptyMessage="暂无自动规则。完成质量分析后将在此展示，您也可手动添加自定义规则。"
@@ -89,6 +97,8 @@ export function RulesPanel({
         </div>
         <RulesList
           rules={customRules}
+          ruleDiffMap={ruleDiffMap}
+          readOnly={readOnly}
           onRuleStatusChange={onRuleStatusChange}
           onParameterChange={onParameterChange}
           onDeleteCustomRule={onDeleteCustomRule}
@@ -109,14 +119,14 @@ export function RulesPanel({
         </div>
         <div className="flex items-center gap-2">
           {onConfirmAll && pendingCount > 0 && (
-            <Button variant="outline" onClick={onConfirmAll} disabled={isLoading} className="gap-2">
+            <Button variant="outline" onClick={onConfirmAll} disabled={isLoading || readOnly} className="gap-2">
               <ListChecks className="w-4 h-4" />
               确认全部
             </Button>
           )}
           <Button
             onClick={onGenerateSQL}
-            disabled={isLoading || confirmedCount === 0}
+            disabled={isLoading || readOnly || confirmedCount === 0}
             className="gap-2"
           >
             {isLoading ? (

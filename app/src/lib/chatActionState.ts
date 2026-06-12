@@ -21,6 +21,9 @@ const VIEW_ONLY_ACTIONS = new Set<ChatMessageAction["type"]>([
 export interface ChatActionSessionContext {
   currentPhase: import("@contracts/types").CleaningPhase;
   targetTable?: string;
+  isFileSource?: boolean;
+  isViewingHistoricalRun?: boolean;
+  isViewingHistoricalRevision?: boolean;
   explorationResult?: ExplorationResult | null;
   qualityReport?: QualityReport | null;
   cleaningRules?: CleaningRule[];
@@ -34,6 +37,12 @@ export function isChatActionDisabled(
   ctx: ChatActionSessionContext
 ): boolean {
   if (action.disabled) return true;
+  if (
+    (ctx.isViewingHistoricalRun || ctx.isViewingHistoricalRevision) &&
+    !VIEW_ONLY_ACTIONS.has(action.type)
+  ) {
+    return true;
+  }
   if (VIEW_ONLY_ACTIONS.has(action.type)) return false;
 
   const rules = ctx.cleaningRules ?? [];
@@ -42,7 +51,7 @@ export function isChatActionDisabled(
 
   switch (action.type) {
     case "selectTable":
-      return !!ctx.explorationResult;
+      return !!ctx.explorationResult || !!ctx.isFileSource;
     case "startExplore":
       return !!ctx.explorationResult;
     case "startAnalysis":
@@ -50,7 +59,8 @@ export function isChatActionDisabled(
     case "confirmAll":
       return allRulesConfirmed || !!ctx.generatedSQL;
     case "generateSQL":
-      return !!ctx.generatedSQL;
+      // 规则经 NL 修改后需允许重新生成 SQL
+      return false;
     case "runFullPipeline":
     case "runAgentPlan":
       return !!ctx.generatedSQL;

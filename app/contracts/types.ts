@@ -11,6 +11,9 @@ export type CleaningPhase =
   | "execute"
   | "retry";
 
+/** 会话探查范围：单表 / 单文件 / 整库 */
+export type SessionScope = "table" | "file" | "whole_db";
+
 export type DataSourceType = "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle" | "csv" | "json" | "xml" | "xlsx";
 
 export type DatabaseDialect = "mysql" | "postgresql" | "sqlite" | "sqlserver" | "oracle";
@@ -43,6 +46,7 @@ export type RuleQualityCategory =
   | "validity"
   | "text"
   | "document"
+  | "filter"
   | "skeleton"
   | "metrics";
 
@@ -159,6 +163,18 @@ export interface QualityReport {
 
 // ---- Cleaning Rules ----
 
+/** 校验/过滤规则无效值处理方式（对齐 问题数据策略） */
+export type InvalidAction =
+  | "reject"
+  | "keep"
+  | "null"
+  | "empty_string"
+  | "custom"
+  | "flag";
+
+/** 码表 dictMap 未匹配值处理方式 */
+export type UnmatchedStrategy = "keep" | "null" | "custom" | "reject";
+
 export interface CleaningRule {
   id: string;
   index: number;
@@ -193,16 +209,26 @@ export interface SQLStep {
   rollbackSql?: string;
 }
 
+/** SQL 生成可选参数（源表过滤、问题表等） */
+export interface SQLGenerationOptions {
+  /** 源表读取 WHERE 子句（不含 WHERE 关键字） */
+  sourceWhereClause?: string;
+  /** 是否生成问题表 `{table}_err` 步骤 */
+  emitProblemTable?: boolean;
+}
+
 export interface SQLGenerationResult {
   targetDialect: DatabaseDialect;
   targetTable: string;
   targetDatabase: string;
   steps: SQLStep[];
-  /** 合并后的主清洗 SQL（单条 INSERT ... SELECT） */
+  /** 合并后的主清洗 SQL（CREATE TABLE + INSERT SELECT） */
   consolidatedSql: string;
   backupSql: string;
   rollbackSql: string;
   totalAffectedRows: number;
+  /** 问题表名（启用 emitProblemTable 时） */
+  problemTableName?: string;
 }
 
 // ---- Execution ----
@@ -274,21 +300,40 @@ export interface SavedDataSourceItem {
   updatedAt: string;
 }
 
+export interface PipelineRunSummary {
+  runIndex: number;
+  createdAt: string;
+}
+
 // ---- Session State ----
 
 export interface SessionState {
   sessionId: string;
   currentPhase: CleaningPhase;
   dataSource?: DataSourceConfig;
+  /** 会话探查范围（可由 targetTable / filePath 推断） */
+  sessionScope?: SessionScope;
   targetTable?: string;
+  /** 源表预过滤 WHERE 子句（不含 WHERE） */
+  sourceWhereClause?: string;
   explorationResult?: ExplorationResult;
   qualityReport?: QualityReport;
   confirmedRules: CleaningRule[];
   generatedSQL?: SQLGenerationResult;
   executionResult?: ExecutionResult;
+  /** 当前 run 的执行历史（最新在前） */
+  executionHistory?: ExecutionResult[];
   retryContext?: RetryContext;
   lastAction: string;
   retryCount: number;
+  /** 当前活跃 run 序号 */
+  currentRunIndex?: number;
+  /** 本次加载所展示的 run 序号 */
+  viewingRunIndex?: number;
+  /** 当前 run 最新里程碑 revision（无快照为 0） */
+  latestRevisionIndex?: number;
+  /** 会话内历史 run 列表 */
+  pipelineRuns?: PipelineRunSummary[];
   createdAt: string;
   updatedAt: string;
   messages: ChatMessage[];
@@ -299,8 +344,14 @@ export interface RuleUpdateIntent {
   field: string;
   variantKey?: string;
   fillValue?: string | number;
+  /** 为 true 时将整列设为固定值（不仅限于空值） */
+  replaceAll?: boolean;
   /** confirm | skip | confirmed | skipped */
   action?: string;
+  /** 新增衍生列名（自然语言「在 X 后添加 Y 列」） */
+  addDerivedColumn?: string;
+  /** 衍生列在规则列表中的插入位置参考字段 */
+  insertAfter?: string;
 }
 
 export interface ChatMessageAction {
@@ -308,6 +359,10 @@ export interface ChatMessageAction {
   label: string;
   /** 为 true 时按钮置灰且不可点击（功能未就绪等） */
   disabled?: boolean;
+  /** 该按钮关联的流水线 run_index（查看历史消息产物时使用） */
+  runIndex?: number;
+  /** 同 run 内里程碑 revision（查看历史规则/SQL 快照） */
+  revisionIndex?: number;
   type:
     | "selectTable"
     | "startExplore"

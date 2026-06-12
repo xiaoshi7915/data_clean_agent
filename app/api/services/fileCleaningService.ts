@@ -7,7 +7,38 @@ import {
 } from "./dataSourceService";
 import { resolveRuleVariant } from "./analysisService";
 import type { CleaningRule, ExecutionResult, FileType, QualityScore } from "@contracts/types";
+import {
+  resolveFieldDictMap,
+  resolveUnmatchedStrategy,
+  applyUnmatchedCellValue,
+  isWhitelistedValue,
+} from "../lib/dictMapRules";
+import {
+  applyInvalidCellValue,
+  invalidFlagSuffix,
+  resolveInvalidAction,
+} from "../lib/invalidAction";
+import { transformIdCard } from "../lib/idCardTransform";
+import { isValidateRulePass } from "../lib/validateRuleSql";
 import { PLACEHOLDER_NULL_VALUE_SET } from "@contracts/cleaningConstants";
+import { parseDateToIso, resolveSourceFormats } from "../lib/dateFormatRules";
+import { isFilterRulePass, isLengthRangePass } from "../lib/filterRules";
+import {
+  fullwidthToHalfwidth,
+  halfwidthToFullwidth,
+  stripCharClasses,
+  substringRange,
+  type StripCharClass,
+} from "../lib/textFormatRules";
+import {
+  collectProblemRecordsForRow,
+  problemFileName,
+  type ProblemRecord,
+} from "../lib/problemRecords";
+import {
+  isEntityValidatePass,
+  isNumericValidatePass,
+} from "../lib/advancedRuleHelpers";
 
 const MOJIBAKE_RE = /Ã.|Â.|â€|ï¿½|锟斤拷|쏙|鐨/;
 
@@ -73,6 +104,82 @@ function isNullishForFill(value: unknown, treatEmptyAsNull?: boolean): boolean {
   return false;
 }
 
+/** 对校验类规则应用 invalidAction */
+function applyValidateInvalidAction(
+  row: Record<string, unknown>,
+  field: string,
+  rule: CleaningRule,
+  isValid: boolean
+): void {
+  const invalidAction = resolveInvalidAction(rule);
+  const ruleType = String(rule.parameters.type ?? "");
+  row[field] = applyInvalidCellValue(row[field], isValid, invalidAction, {
+    customValue: rule.parameters.customValue as string | undefined,
+    flagSuffix: invalidFlagSuffix(ruleType),
+  });
+}
+
+function applyDictMapToCell(
+  row: Record<string, unknown>,
+  field: string,
+  rule: CleaningRule
+): void {
+  const value = row[field];
+  if (isEmptyValue(value)) return;
+  const strVal = String(value).trim();
+  const dictMap = resolveFieldDictMap(rule.parameters, field);
+  const whitelist = rule.parameters.whitelist as string[] | undefined;
+  const strategy = resolveUnmatchedStrategy(rule.parameters);
+
+  if (isWhitelistedValue(strVal, whitelist)) return;
+
+  if (dictMap[strVal] !== undefined) {
+    row[field] = dictMap[strVal];
+    return;
+  }
+
+  if (Object.keys(dictMap).length === 0) return;
+
+  row[field] = applyUnmatchedCellValue(
+    value,
+    strategy,
+    rule.parameters.customUnmatchedValue as string | undefined
+  );
+}
+
+function shouldRejectByValidateRule(row: Record<string, unknown>, rule: CleaningRule): boolean {
+  if (resolveInvalidAction(rule) !== "reject") return false;
+  const type = rule.parameters.type as string | undefined;
+  const value = row[rule.field];
+  if (type === "id_card_transform") {
+    if (isEmptyValue(value)) return false;
+    return transformIdCard(String(value)) === null;
+  }
+  return !isValidateRulePass(rule, value);
+}
+
+function shouldRejectByFilterRule(row: Record<string, unknown>, rule: CleaningRule): boolean {
+  if (resolveInvalidAction(rule) !== "reject") return false;
+  const type = rule.parameters.type as string | undefined;
+  if (type === "compare_filter" || type === "length_range" || type === "regex_filter" || type === "domain_filter") {
+    return !isFilterRulePass(rule, row);
+  }
+  return false;
+}
+
+function shouldRejectByDictMapRule(row: Record<string, unknown>, rule: CleaningRule): boolean {
+  if (resolveUnmatchedStrategy(rule.parameters) !== "reject") return false;
+  const field = rule.field;
+  const value = row[field];
+  if (isEmptyValue(value)) return false;
+  const strVal = String(value).trim();
+  const dictMap = resolveFieldDictMap(rule.parameters, field);
+  const whitelist = rule.parameters.whitelist as string[] | undefined;
+  if (isWhitelistedValue(strVal, whitelist)) return false;
+  if (Object.keys(dictMap).length === 0) return false;
+  return dictMap[strVal] === undefined;
+}
+
 function applyFieldTransform(
   row: Record<string, unknown>,
   rule: CleaningRule
@@ -84,7 +191,8 @@ function applyFieldTransform(
 
   switch (rule.action) {
     case "fill_null": {
-      if (!isNullishForFill(value, rule.parameters.treatEmptyAsNull === true)) break;
+      const replaceAll = rule.parameters.replaceAll === true;
+      if (!replaceAll && !isNullishForFill(value, rule.parameters.treatEmptyAsNull === true)) break;
       const strategy = (rule.parameters.strategy as string) || "fixed";
       if (strategy === "mean" || strategy === "ffill" || strategy === "bfill") {
         break;
@@ -129,8 +237,23 @@ function applyFieldTransform(
           row[field] = str.replace(/\D/g, "");
           break;
         case "DATE_ISO": {
-          const parsed = new Date(str);
-          row[field] = Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
+          const sourceFormats = resolveSourceFormats(rule.parameters);
+          const iso = parseDateToIso(str, sourceFormats);
+          row[field] = iso;
+          break;
+        }
+        case "HALFWIDTH":
+          row[field] = halfwidthToFullwidth(str);
+          break;
+        case "strip_chars": {
+          const classes = (rule.parameters.charClasses as StripCharClass[] | undefined) ?? ["digit"];
+          row[field] = stripCharClasses(str, classes);
+          break;
+        }
+        case "substring": {
+          const start = (rule.parameters.start as number) ?? 1;
+          const end = rule.parameters.end as number | undefined;
+          row[field] = substringRange(str, start, end);
           break;
         }
         case "COLLAPSE_WS":
@@ -140,9 +263,7 @@ function applyFieldTransform(
           row[field] = str.replace(/<[^>]+>/g, "");
           break;
         case "FULLWIDTH":
-          row[field] = str.replace(/[\uFF01-\uFF5E]/g, (ch) =>
-            String.fromCharCode(ch.charCodeAt(0) - 0xfee0)
-          );
+          row[field] = fullwidthToHalfwidth(str);
           break;
         default:
           row[field] = str.trim();
@@ -151,6 +272,15 @@ function applyFieldTransform(
     }
     case "standardize": {
       if (isEmptyValue(value)) break;
+      const stdType = rule.parameters.type as string | undefined;
+      const filterOnly =
+        stdType === "compare_filter" ||
+        stdType === "regex_filter" ||
+        stdType === "domain_filter" ||
+        (stdType === "length_range" && resolveInvalidAction(rule) === "reject");
+      if (filterOnly) {
+        break;
+      }
       if (rule.parameters.type === "placeholder_null") {
         const key = String(value).trim().toLowerCase();
         if (PLACEHOLDER_NULL_VALUE_SET.has(key)) {
@@ -168,19 +298,43 @@ function applyFieldTransform(
         const num = Number(value);
         const min = (rule.parameters.min as number) ?? 0;
         const max = (rule.parameters.max as number) ?? 150;
-        row[field] = num < min || num > max ? null : value;
+        const isValid = !Number.isNaN(num) && num >= min && num <= max;
+        if (rule.parameters.type === "range_validate") {
+          applyValidateInvalidAction(row, field, rule, isValid);
+        } else {
+          row[field] = isValid ? value : null;
+        }
         break;
       }
       if (rule.parameters.type === "length_validate") {
         const expected = (rule.parameters.expectedLength as number) ?? 11;
         const len = String(value).trim().length;
-        if (len !== expected) row[field] = null;
+        applyValidateInvalidAction(row, field, rule, len === expected);
+        break;
+      }
+      if (rule.parameters.type === "length_range") {
+        applyValidateInvalidAction(row, field, rule, isLengthRangePass(rule, value));
+        break;
+      }
+      if (rule.parameters.type === "decimal_precision" || rule.parameters.type === "integer_validate") {
+        applyValidateInvalidAction(row, field, rule, isNumericValidatePass(rule, value));
+        break;
+      }
+      if (
+        rule.parameters.type === "credit_code_validate" ||
+        rule.parameters.type === "landline_validate" ||
+        rule.parameters.type === "mac_validate" ||
+        rule.parameters.type === "ip_validate" ||
+        rule.parameters.type === "longitude_validate" ||
+        rule.parameters.type === "latitude_validate"
+      ) {
+        applyValidateInvalidAction(row, field, rule, isEntityValidatePass(rule, value));
         break;
       }
       if (rule.parameters.type === "regex_validate") {
         try {
           const pattern = new RegExp(String(rule.parameters.pattern ?? ".*"));
-          if (!pattern.test(String(value))) row[field] = null;
+          applyValidateInvalidAction(row, field, rule, pattern.test(String(value)));
         } catch {
           // 无效正则则跳过
         }
@@ -188,15 +342,25 @@ function applyFieldTransform(
       }
       if (rule.parameters.type === "email_validate") {
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(String(value))) {
-          row[field] = rule.parameters.invalidAction === "flag" ? "INVALID_EMAIL" : null;
-        }
+        applyValidateInvalidAction(row, field, rule, emailRegex.test(String(value)));
         break;
       }
       if (rule.parameters.type === "phone_validate") {
         const digits = String(value).replace(/\D/g, "");
-        if (digits.length < 7 || digits.length > 15) {
-          row[field] = rule.parameters.invalidAction === "flag" ? "INVALID_PHONE" : null;
+        const isValid = digits.length >= 7 && digits.length <= 15;
+        if (isValid) {
+          row[field] = digits;
+        } else {
+          applyValidateInvalidAction(row, field, rule, false);
+        }
+        break;
+      }
+      if (rule.parameters.type === "id_card_transform") {
+        const transformed = transformIdCard(String(value));
+        if (transformed !== null) {
+          row[field] = transformed;
+        } else {
+          applyValidateInvalidAction(row, field, rule, false);
         }
         break;
       }
@@ -212,16 +376,18 @@ function applyFieldTransform(
         row[field] = tryFixEncoding(String(value));
         break;
       }
-      if (rule.parameters.type === "fk_reference") {
-        const dictMap = rule.parameters.dictMap as Record<string, string> | undefined;
-        const allowed = rule.parameters.allowedValues as string[] | undefined;
-        const strVal = String(value).trim();
-        if (dictMap && dictMap[strVal] !== undefined) {
-          row[field] = dictMap[strVal];
-          break;
-        }
-        if (allowed && allowed.length > 0 && !allowed.includes(strVal)) {
-          row[field] = rule.parameters.invalidAction === "flag" ? "FK_INVALID" : null;
+      if (
+        rule.parameters.type === "fk_reference" ||
+        rule.parameters.type === "dictMap" ||
+        rule.parameters.fromCodeTable
+      ) {
+        applyDictMapToCell(row, field, rule);
+        if (rule.parameters.type === "fk_reference") {
+          const allowed = rule.parameters.allowedValues as string[] | undefined;
+          const strVal = String(value).trim();
+          if (allowed && allowed.length > 0 && !allowed.includes(strVal)) {
+            applyValidateInvalidAction(row, field, rule, false);
+          }
         }
         break;
       }
@@ -422,6 +588,24 @@ export function applyCleaningRulesToRows(
   rules: CleaningRule[],
   columns: string[]
 ): Record<string, unknown>[] {
+  return applyCleaningRulesInternal(rows, rules, columns).cleaned;
+}
+
+/** 应用清洗规则并收集问题记录（P1-R4） */
+export function applyCleaningRulesWithProblems(
+  rows: Record<string, unknown>[],
+  rules: CleaningRule[],
+  columns: string[]
+): { cleaned: Record<string, unknown>[]; problems: ProblemRecord[] } {
+  return applyCleaningRulesInternal(rows, rules, columns, true);
+}
+
+function applyCleaningRulesInternal(
+  rows: Record<string, unknown>[],
+  rules: CleaningRule[],
+  columns: string[],
+  collectProblems = false
+): { cleaned: Record<string, unknown>[]; problems: ProblemRecord[] } {
   const confirmed = rules
     .filter((r) => r.status === "confirmed")
     .map(resolveRuleVariant);
@@ -466,6 +650,9 @@ export function applyCleaningRulesToRows(
     .map((row) => {
       for (const rule of confirmed) {
         if (shouldRemoveRow(row, rule)) return null;
+        if (shouldRejectByFilterRule(row, rule)) return null;
+        if (shouldRejectByValidateRule(row, rule)) return null;
+        if (shouldRejectByDictMapRule(row, rule)) return null;
       }
       const out = { ...row };
       for (const rule of confirmed) {
@@ -479,7 +666,15 @@ export function applyCleaningRulesToRows(
     result = deduplicateRows(result, confirmed, columns);
   }
 
-  return result;
+  if (collectProblems) {
+    const problems: ProblemRecord[] = [];
+    for (const row of working) {
+      problems.push(...collectProblemRecordsForRow(row, confirmed));
+    }
+    return { cleaned: result, problems };
+  }
+
+  return { cleaned: result, problems: [] };
 }
 
 export async function executeFileCleaning(
@@ -497,10 +692,14 @@ export async function executeFileCleaning(
     const loaded = await loadFullFileData(filePath, fileType);
     const originalCount = loaded.rows.length;
 
-    const cleanedRows =
-      rules.filter((r) => r.status === "confirmed").length === 0
-        ? loaded.rows
-        : applyCleaningRulesToRows(loaded.rows, rules, loaded.columns);
+    const confirmedRules = rules.filter((r) => r.status === "confirmed");
+    const applyResult =
+      confirmedRules.length === 0
+        ? { cleaned: loaded.rows, problems: [] as ProblemRecord[] }
+        : applyCleaningRulesWithProblems(loaded.rows, rules, loaded.columns);
+
+    const cleanedRows = applyResult.cleaned;
+    const problemRows = applyResult.problems;
 
     const exportColumns = [
       ...new Set([
@@ -517,6 +716,22 @@ export async function executeFileCleaning(
         jsonExport: loaded.jsonExport,
         xmlExport: loaded.xmlExport,
       });
+      if (problemRows.length > 0) {
+        const errFileName = problemFileName(originalFileName);
+        const errPath = getUploadPath(errFileName);
+        const errRecords = problemRows.map((p) => ({
+          err_field: p.err_field,
+          err_data: p.err_data,
+          err_rule_name: p.err_rule_name,
+          err_type: p.err_type,
+        }));
+        writeCleanedFile(errPath, "csv", errRecords, [
+          "err_field",
+          "err_data",
+          "err_rule_name",
+          "err_type",
+        ]);
+      }
     }
 
     const metricsAfter: QualityScore = {
