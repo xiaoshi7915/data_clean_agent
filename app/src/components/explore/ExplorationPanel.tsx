@@ -46,6 +46,11 @@ export function ExplorationPanel({ result, onConfirm, onSkip, isLoading, embedde
             <h2 className="text-base font-semibold">数据源探查报告</h2>
             <p className="text-xs text-muted-foreground truncate">{result.sourceName}</p>
           </div>
+          {(result.sampleBasedStats || result.rowCountApproximate) && (
+            <Badge variant="secondary" className="shrink-0">
+              基于抽样探查
+            </Badge>
+          )}
         </div>
         <div className="flex gap-2 shrink-0">
           <Button variant="outline" size="sm" onClick={onSkip} disabled={isLoading}>
@@ -66,7 +71,12 @@ export function ExplorationPanel({ result, onConfirm, onSkip, isLoading, embedde
               <Rows3 className="w-3.5 h-3.5 text-primary shrink-0" />
               <span className="text-xs text-muted-foreground truncate">总行数</span>
             </div>
-            <p className="text-lg font-bold mt-1">{result.totalRows.toLocaleString()}</p>
+            <p className="text-lg font-bold mt-1">
+              {result.totalRows.toLocaleString()}
+              {result.rowCountApproximate && (
+                <span className="text-xs font-normal text-muted-foreground ml-1">估算行数</span>
+              )}
+            </p>
           </CardContent>
         </Card>
         <Card className="min-w-0">

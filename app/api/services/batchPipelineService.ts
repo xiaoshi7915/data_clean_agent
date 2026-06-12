@@ -69,7 +69,11 @@ async function persistSqlSteps(
  */
 export async function runBatchPipelineForDatabase(
   sessionId: string,
-  options?: { maxTables?: number; skipTables?: string[] }
+  options?: {
+    maxTables?: number;
+    skipTables?: string[];
+    onTableStart?: (tableName: string, index: number, total: number) => void;
+  }
 ): Promise<BatchPipelineResult> {
   const session = await getSession(sessionId);
   if (!session?.dataSource?.dbConfig) {
@@ -96,7 +100,9 @@ export async function runBatchPipelineForDatabase(
   const results: BatchTableResult[] = [];
   const dataSource = session.dataSource as DataSourceConfig;
 
-  for (const tableName of tableNames) {
+  for (let i = 0; i < tableNames.length; i++) {
+    const tableName = tableNames[i];
+    options?.onTableStart?.(tableName, i, tableNames.length);
     try {
       const childSessionId = await createSession(dataSource, tableName, {
         title: `${tableName} · 整库批量`,

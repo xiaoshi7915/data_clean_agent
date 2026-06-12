@@ -48,7 +48,16 @@ export default function Home() {
 
   const { data: orchestratorRuns } = trpc.orchestrator.listBySession.useQuery(
     { sessionId: session.sessionId! },
-    { enabled: !!session.sessionId, refetchInterval: session.sessionId ? 5000 : false }
+    {
+      enabled: !!session.sessionId,
+      // 无活跃编排 run 时不轮询，避免 DevTools 中每 5s 出现空的 listBySession
+      refetchInterval: (query) => {
+        const runs = query.state.data?.runs;
+        if (!runs) return false;
+        const hasActive = runs.some((r) => r.state !== "done" && r.state !== "failed");
+        return hasActive || !!orchestratorRunId ? 5000 : false;
+      },
+    }
   );
 
   const activeRun = orchestratorRuns?.runs?.find(
@@ -289,12 +298,12 @@ export default function Home() {
         tableExploreButtonLabel={
           reExploreFromRetry || session.currentPhase === "retry" ? "重新探查" : "开始探查"
         }
-        onExplore={async (table) => {
-          const result = await session.runAutoExploreAndAnalyze(table);
+        onExplore={async (table, options) => {
+          const result = await session.runAutoExploreAndAnalyze(table, options);
           if (result) setReExploreFromRetry(false);
         }}
-        onRunFullPipeline={async (table) => {
-          await session.runPipelineToGenerateSQL(table);
+        onRunFullPipeline={async (table, options) => {
+          await session.runPipelineToGenerateSQL(table, options);
         }}
         explorationResult={session.explorationResult}
         qualityReport={session.qualityReport}
@@ -379,6 +388,13 @@ export default function Home() {
               executionHistory={session.executionHistory}
               scriptOnly={scriptOnly}
               onExportBundle={() => void session.exportArtifactBundle()}
+              onBack={() => {
+                if (session.sessionId) {
+                  void session.syncPhase(session.sessionId, "generate");
+                } else {
+                  session.setCurrentPhase("generate");
+                }
+              }}
               onRetry={() => {
                 if (session.executionResult?.error && session.generatedSQL) {
                   const failedStep = session.executionResult.stepResults.find((s) => s.status === "failed");

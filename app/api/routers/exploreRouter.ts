@@ -7,6 +7,13 @@ import { runSchemaAgent } from "../agents/schemaAgent";
 import { validatePhaseTransition, PhaseValidationError, HistoricalRunWriteError } from "../services/phaseValidator";
 import { persistExploration } from "../services/explorationPersistenceService";
 import { resolveExistingUploadPath } from "../services/uploadPathService";
+import {
+  completeExploreProgress,
+  createExploreProgressReporter,
+  failExploreProgress,
+  resetExploreProgress,
+} from "../services/exploreProgressService";
+import { mapExploreQueryError } from "../lib/exploreQueryTimeout";
 
 const dbConfigSchema = z.object({
   host: z.string(),
@@ -86,9 +93,14 @@ export const exploreRouter = createRouter({
         tableName: z.string(),
         limit: z.number().optional().default(100),
         dbType: z.enum(["mysql", "postgresql", "sqlite", "sqlserver", "oracle"]).optional(),
+        /** 大表是否强制执行精确 COUNT(*) */
+        exactRowCount: z.boolean().optional().default(false),
       })
     )
     .mutation(async ({ input }) => {
+      resetExploreProgress(input.sessionId);
+      const onProgress = createExploreProgressReporter(input.sessionId);
+
       try {
         await validatePhaseTransition(input.sessionId, "explore", input.runIndex);
         const resolvedConfig = await resolveDbConfigInput(input.sessionId, input.config);
@@ -101,8 +113,11 @@ export const exploreRouter = createRouter({
           },
           tableName: input.tableName,
           limit: input.limit,
+          exactRowCount: input.exactRowCount,
+          onProgress,
         });
         if (!agentResult.success || !agentResult.data) {
+          failExploreProgress(input.sessionId, agentResult.error ?? "探查失败");
           return {
             success: false,
             error: agentResult.error ?? "探查失败",
@@ -117,14 +132,14 @@ export const exploreRouter = createRouter({
           sessionTitle: `${input.tableName} · 探查完成`,
         });
 
+        completeExploreProgress(input.sessionId);
         return { success: true, result };
       } catch (error) {
         const message =
           error instanceof PhaseValidationError || error instanceof HistoricalRunWriteError
             ? error.message
-            : error instanceof Error
-            ? error.message
-            : String(error);
+            : mapExploreQueryError(error).message;
+        failExploreProgress(input.sessionId, message);
         return { success: false, error: message, result: null };
       }
     }),

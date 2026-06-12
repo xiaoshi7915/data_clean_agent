@@ -20,7 +20,6 @@ import {
 import {
   Database,
   Plus,
-  Clock,
   ChevronDown,
   ChevronRight,
   MessageCircle,
@@ -30,13 +29,6 @@ import {
   MoreHorizontal,
   Inbox,
 } from "lucide-react";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import type { CleaningPhase, SessionListItem, SavedDataSourceItem } from "@contracts/types";
 
 interface SidebarProps {
@@ -237,6 +229,12 @@ export function Sidebar({
     return map;
   }, [sessionList]);
 
+  /** 当前会话所属数据源：默认折叠，选中会话时自动展开对应分组 */
+  const activeDataSourceId = useMemo(() => {
+    const current = sessionList.find((s) => s.sessionId === currentSessionId);
+    return current?.dataSourceId;
+  }, [sessionList, currentSessionId]);
+
   const toggleSource = (id: string) => {
     setExpandedSources((prev) => ({ ...prev, [id]: !prev[id] }));
   };
@@ -289,7 +287,9 @@ export function Sidebar({
             <div className="space-y-2 pb-4">
               {savedDataSources.map((source) => {
                 const sessions = sessionsBySource.get(source.dataSourceId) || [];
-                const expanded = expandedSources[source.dataSourceId] ?? true;
+                const expanded =
+                  expandedSources[source.dataSourceId] ??
+                  (source.dataSourceId === activeDataSourceId && !!activeDataSourceId);
                 return (
                   <div
                     key={source.dataSourceId}
@@ -360,52 +360,6 @@ export function Sidebar({
             </div>
           )}
         </div>
-
-        <div className="p-4 border-t space-y-2 shrink-0">
-          <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
-            <Clock className="w-3 h-3" />
-            最近会话
-          </h3>
-          {sessionList.length === 0 ? (
-            <div className="py-4 text-center rounded-lg border border-dashed bg-muted/15">
-              <p className="text-xs text-muted-foreground">暂无历史对话</p>
-            </div>
-          ) : (
-            <>
-              <Select
-                value={currentSessionId || undefined}
-                onValueChange={(id) => onSelectSession(id)}
-              >
-                <SelectTrigger className="w-full h-9 text-xs bg-card/60 border-primary/20">
-                  <SelectValue placeholder="选择历史会话…" />
-                </SelectTrigger>
-                <SelectContent className="max-h-56">
-                  {sessionList.map((session) => (
-                    <SelectItem key={session.sessionId} value={session.sessionId} className="text-xs">
-                      <span className="truncate">
-                        {sessionLabel(session)}
-                        <span className="text-muted-foreground ml-1">
-                          · {phaseLabel[session.currentPhase]}
-                        </span>
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <div className="max-h-36 overflow-y-auto space-y-1 pr-0.5">
-                {sessionList.slice(0, 8).map((session) => (
-                  <SessionItem
-                    key={session.sessionId}
-                    session={session}
-                    isActive={session.sessionId === currentSessionId}
-                    onSelect={() => onSelectSession(session.sessionId)}
-                    onDelete={() => setPendingDeleteId(session.sessionId)}
-                  />
-                ))}
-              </div>
-            </>
-          )}
-        </div>
       </div>
 
       <AlertDialog open={!!pendingDeleteId} onOpenChange={(open) => !open && setPendingDeleteId(null)}>
@@ -441,7 +395,7 @@ export function Sidebar({
           <AlertDialogHeader>
             <AlertDialogTitle>删除此数据源？</AlertDialogTitle>
             <AlertDialogDescription>
-              将从侧栏隐藏「{pendingSource?.name ?? "该数据源"}」。已有清洗对话不会被删除，仍可在「最近会话」中打开。
+              将从侧栏隐藏「{pendingSource?.name ?? "该数据源"}」。已有清洗对话不会被删除，仍可在其他已保存数据源下打开。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

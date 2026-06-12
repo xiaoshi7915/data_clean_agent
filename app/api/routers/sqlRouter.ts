@@ -90,6 +90,7 @@ export const sqlRouter = createRouter({
                 strategy: r.strategy ?? "",
                 parameters: r.parameters ?? {},
               }));
+        const session = await getSession(input.sessionId);
         const agentResult = runRepairAgent({
           sessionId: input.sessionId,
           rules: rulesSource,
@@ -97,7 +98,10 @@ export const sqlRouter = createRouter({
           tableName: input.tableName,
           databaseName: input.databaseName,
           columns: input.columns ?? [],
-          sourceWhereClause: (await getSession(input.sessionId))?.sourceWhereClause,
+          sourceWhereClause: session?.sourceWhereClause,
+          explorationSampleBased: session?.explorationResult?.sampleBasedStats,
+          explorationRowCountApproximate: session?.explorationResult?.rowCountApproximate,
+          explorationSampleSize: session?.explorationResult?.sampleSize,
         });
         if (!agentResult.success || !agentResult.data) {
           return { success: false, error: agentResult.error ?? "SQL生成失败", result: null };

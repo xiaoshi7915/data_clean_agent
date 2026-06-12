@@ -28,7 +28,8 @@ export async function runExploration(
   dataSource: NonNullable<CleaningSessionState["dataSource"]>,
   tableName: string | undefined,
   mutations: ExploreMutations,
-  runIndex?: number
+  runIndex?: number,
+  options?: { exactRowCount?: boolean }
 ): Promise<{ exploration: ExplorationResult; resolvedTable: string }> {
   const isDbSource = isDbSourceType(dataSource.type);
   let resolvedTable = tableName?.trim() || "";
@@ -47,6 +48,7 @@ export async function runExploration(
       tableName: resolvedTable,
       limit: 100,
       dbType: toExploreDbType(dataSource.type),
+      exactRowCount: options?.exactRowCount ?? false,
     });
     if (!exploreResult.success || !exploreResult.result) {
       throw new Error(exploreResult.error || "探查失败");
@@ -84,5 +86,11 @@ export function cleanedOutputHint(
 }
 
 export function exploreCompleteMessage(exploration: ExplorationResult): string {
-  return `📊 数据探查完成！\n\n**${exploration.sourceName}**\n- 总行数：${exploration.totalRows.toLocaleString()} 行\n- 总列数：${exploration.totalCols} 列\n- 发现 ${exploration.issues.length} 个潜在问题`;
+  const rowLabel = exploration.rowCountApproximate
+    ? `${exploration.totalRows.toLocaleString()} 行（估算行数）`
+    : `${exploration.totalRows.toLocaleString()} 行`;
+  const sampleNote = exploration.sampleBasedStats
+    ? `\n- 列统计基于前 ${exploration.sampleSize} 行样本估算`
+    : "";
+  return `📊 数据探查完成！\n\n**${exploration.sourceName}**\n- 总行数：${rowLabel}\n- 总列数：${exploration.totalCols} 列\n- 发现 ${exploration.issues.length} 个潜在问题${sampleNote}`;
 }

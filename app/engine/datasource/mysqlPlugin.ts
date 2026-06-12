@@ -38,7 +38,12 @@ export const mysqlDataSourcePlugin: DataSourcePlugin = {
       options.sessionId ?? "cli",
       config,
       options.tableName,
-      options.limit ?? 100
+      options.limit ?? 100,
+      "mysql",
+      {
+        exactRowCount: options.exactRowCount,
+        onProgress: options.onProgress,
+      }
     );
   },
 };

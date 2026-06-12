@@ -13,7 +13,7 @@ import {
   RotateCcw,
   Download,
   TrendingUp,
-
+  ArrowLeft,
 } from "lucide-react";
 import type { ExecutionResult } from "@contracts/types";
 
@@ -27,6 +27,8 @@ interface ExecutionPanelProps {
   scriptOnly?: boolean;
   onExportBundle?: () => void;
   isFileSource?: boolean;
+  /** 返回会话聊天视图（不丢失执行结果等会话状态） */
+  onBack?: () => void;
 }
 
 export function ExecutionPanel({
@@ -37,10 +39,19 @@ export function ExecutionPanel({
   scriptOnly = false,
   onExportBundle,
   isFileSource = false,
+  onBack,
 }: ExecutionPanelProps) {
+  const backButton = onBack ? (
+    <Button variant="outline" onClick={onBack} className="gap-1.5 w-fit">
+      <ArrowLeft className="w-3.5 h-3.5" />
+      返回会话
+    </Button>
+  ) : null;
+
   if (!result) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-4">
+        {backButton && <div className="self-start w-full mb-2">{backButton}</div>}
         <div className="w-16 h-16 rounded-full bg-primary/10 flex items-center justify-center">
           <Play className="w-8 h-8 text-primary" />
         </div>
@@ -72,6 +83,7 @@ export function ExecutionPanel({
 
   return (
     <div className="space-y-4">
+      {backButton}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">

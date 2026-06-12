@@ -40,6 +40,27 @@ export function cleanedTableName(tableName: string): string {
   return `${tableName}_cleaned`;
 }
 
+/** 探查基于样本时在生成 SQL 顶部写入说明注释 */
+export function buildExplorationSamplingSqlHeader(options: SQLGenerationOptions): string {
+  const lines: string[] = [];
+  if (options.explorationSampleBased) {
+    lines.push(
+      `-- 清洗规则基于抽样探查（${options.explorationSampleSize ?? "N/A"} 行样本）推导；以下 INSERT SELECT 仍对源表/文件全量执行。`
+    );
+  }
+  if (options.explorationRowCountApproximate) {
+    lines.push("-- 探查阶段行数为 catalog/文件估算值，未执行精确 COUNT(*)。");
+  }
+  if (lines.length === 0) return "";
+  return `${lines.join("\n")}\n\n`;
+}
+
+function finalizeConsolidatedSql(steps: SQLStep[], options: SQLGenerationOptions): string {
+  const body = buildConsolidatedCleaningSql(steps);
+  const header = buildExplorationSamplingSqlHeader(options);
+  return header ? `${header}${body}` : body;
+}
+
 /** 合并主清洗 SQL：CREATE TABLE（及衍生列 ALTER）+ INSERT SELECT */
 export function buildConsolidatedCleaningSql(steps: SQLStep[]): string {
   const createOutputStep = steps.find(
@@ -82,7 +103,14 @@ export function generateCleaningSQL(
   const outputTableName = cleanedTableName(tableName);
 
   if (confirmedRules.length === 0) {
-    return generatePassthroughSQL(dialect, tableName, databaseName, backupTableName, outputTableName);
+    return generatePassthroughSQL(
+      dialect,
+      tableName,
+      databaseName,
+      backupTableName,
+      outputTableName,
+      options
+    );
   }
 
   const allColumns = resolveColumns(columns, confirmedRules);
@@ -222,7 +250,7 @@ export function generateCleaningSQL(
     }
   }
 
-  const consolidatedSql = buildConsolidatedCleaningSql(steps);
+  const consolidatedSql = finalizeConsolidatedSql(steps, options);
 
   const totalAffectedRows = confirmedRules.reduce((sum, r) => sum + (r.affectedRows || 0), 0);
 
@@ -244,7 +272,8 @@ function generatePassthroughSQL(
   tableName: string,
   databaseName: string,
   backupTableName: string,
-  outputTableName: string
+  outputTableName: string,
+  options: SQLGenerationOptions = {}
 ): SQLGenerationResult {
   const quotedSource = quoteTable(tableName, dialect);
   const quotedOutput = quoteTable(outputTableName, dialect);
@@ -292,7 +321,7 @@ function generatePassthroughSQL(
     },
   ];
 
-  const consolidatedSql = buildConsolidatedCleaningSql(steps);
+  const consolidatedSql = finalizeConsolidatedSql(steps, options);
 
   return {
     targetDialect: dialect,

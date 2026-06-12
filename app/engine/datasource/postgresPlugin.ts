@@ -16,6 +16,21 @@ import { runSqlSteps } from "../execution/runSqlSteps";
 import { createPostgresExecutor } from "../execution/sqlExecutor";
 import type { DataSourcePlugin, ExploreOptions, ExecuteOptions } from "./plugin";
 import { registerDataSourcePlugin } from "./plugin";
+import {
+  buildSampleStatsFromClause,
+  scaleNullCountFromSample,
+  shouldUseApproximateRowCount,
+  shouldUseSampleStats,
+} from "./dbExploreSampling";
+import {
+  EXPLORE_COLUMN_STATS_CONCURRENCY,
+  mapWithConcurrency,
+} from "./exploreColumnStats";
+import {
+  mapExploreQueryError,
+  withExploreQueryTimeout,
+} from "../../api/lib/exploreQueryTimeout";
+import type { ExploreProgressStep } from "../../api/services/exploreProgressService";
 
 const { Pool } = pg;
 
@@ -91,25 +106,57 @@ async function listPostgresTables(config: DBConnectionConfig): Promise<DatabaseT
   });
 }
 
+async function pgTimedQuery<T>(
+  client: pg.PoolClient,
+  sql: string,
+  params?: unknown[]
+): Promise<T> {
+  return withExploreQueryTimeout(async () => {
+    const result = await client.query(sql, params);
+    return result.rows as T;
+  });
+}
+
 async function explorePostgresTable(
   config: DBConnectionConfig,
   tableName: string,
-  limit: number
+  limit: number,
+  options?: {
+    exactRowCount?: boolean;
+    onProgress?: (
+      step: ExploreProgressStep,
+      message: string,
+      meta?: { columnIndex?: number; columnTotal?: number }
+    ) => void;
+  }
 ): Promise<ExplorationResult> {
   const safeTable = sanitizeTableName(tableName);
   const safeLimit = sanitizeLimit(limit);
   const schema = config.schema || "public";
   const quotedTable = postgresDialect.quoteTable(safeTable);
+  const report = options?.onProgress;
 
   return withClient(config, async (client) => {
-    const columnsResult = await client.query(
+    try {
+      report?.("connecting", "正在连接 PostgreSQL…");
+      report?.("loading_schema", "正在读取表结构…");
+      const columnsResult = await pgTimedQuery<
+        Array<{
+          column_name: string;
+          data_type: string;
+          is_nullable: string;
+          column_default: string | null;
+          character_maximum_length: number | null;
+        }>
+      >(
+        client,
       `SELECT column_name, data_type, is_nullable, column_default,
               character_maximum_length
        FROM information_schema.columns
        WHERE table_schema = $1 AND table_name = $2
        ORDER BY ordinal_position`,
       [schema, safeTable]
-    );
+      );
 
     const metricCollector = new ExplorationMetricCollector(
       postgresDialect,
@@ -117,85 +164,140 @@ async function explorePostgresTable(
       (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
     );
 
-    const countResult = await client.query(metricCollector.buildCountSql("row_count"));
-    const totalRows = Number(countResult.rows[0]?.cnt) || 0;
+    report?.("counting_rows", "正在统计行数…");
+    const estimateRows = await pgTimedQuery<{ est: number }[]>(
+      client,
+      `SELECT COALESCE(c.reltuples::bigint, 0) AS est
+       FROM pg_class c
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r'`,
+      [schema, safeTable]
+    );
+    const rowEstimate = Number(estimateRows[0]?.est) || 0;
 
-    const sampleResult = await client.query(
+    let totalRows: number;
+    let rowCountApproximate = false;
+
+    const skipExactCount =
+      shouldUseApproximateRowCount(rowEstimate) && !options?.exactRowCount;
+
+    if (skipExactCount) {
+      totalRows = rowEstimate;
+      rowCountApproximate = true;
+    } else {
+      const countRows = await pgTimedQuery<{ cnt: number }[]>(
+        client,
+        metricCollector.buildCountSql("row_count")
+      );
+      totalRows = Number(countRows[0]?.cnt) || 0;
+    }
+
+    const useSampleStats = shouldUseSampleStats(totalRows);
+    const statsFrom = useSampleStats
+      ? buildSampleStatsFromClause("postgresql", quotedTable, safeLimit)
+      : quotedTable;
+    const statsRowCount = useSampleStats ? Math.min(safeLimit, totalRows) : totalRows;
+
+    report?.("sampling", `正在抽取样本（最多 ${safeLimit} 行）…`);
+    const sampleRows = await pgTimedQuery<Record<string, unknown>[]>(
+      client,
       `SELECT * FROM ${quotedTable} LIMIT ${safeLimit}`
     );
 
-    const columnStats: ColumnStats[] = [];
-    const schemaInfo: ColumnInfo[] = [];
+    const schemaInfo: ColumnInfo[] = columnsResult.map((col) => ({
+      name: String(col.column_name),
+      type: String(col.data_type),
+      nullable: col.is_nullable === "YES",
+      defaultValue: col.column_default ? String(col.column_default) : undefined,
+      maxLength: col.character_maximum_length
+        ? Number(col.character_maximum_length)
+        : undefined,
+    }));
+
+    const columnTotal = columnsResult.length;
+    const concurrency = useSampleStats ? 1 : EXPLORE_COLUMN_STATS_CONCURRENCY;
+
+    const columnStats = await mapWithConcurrency(
+      columnsResult,
+      concurrency,
+      async (col, index) => {
+        const columnName = String(col.column_name);
+        report?.(
+          "column_stats",
+          `列统计 ${index + 1}/${columnTotal}：${columnName}`,
+          { columnIndex: index + 1, columnTotal }
+        );
+
+        const quotedCol = postgresDialect.quoteIdentifier(columnName);
+        const nullRows = await pgTimedQuery<{ cnt: number }[]>(
+          client,
+          useSampleStats
+            ? `SELECT SUM(CASE WHEN ${quotedCol} IS NULL THEN 1 ELSE 0 END) AS cnt FROM ${statsFrom}`
+            : metricCollector.buildCountSql("null_count", columnName)
+        );
+        const sampleNullCount = Number(nullRows[0]?.cnt) || 0;
+
+        const uniqueRows = await pgTimedQuery<{ cnt: number }[]>(
+          client,
+          useSampleStats
+            ? `SELECT COUNT(DISTINCT ${quotedCol}) AS cnt FROM ${statsFrom}`
+            : metricCollector.buildCountSql("distinct_count", columnName)
+        );
+        const uniqueCount = Number(uniqueRows[0]?.cnt) || 0;
+
+        const sampleValuesRows = await pgTimedQuery<{ val: string | number | null }[]>(
+          client,
+          `SELECT DISTINCT ${quotedCol} AS val FROM ${statsFrom} WHERE ${quotedCol} IS NOT NULL LIMIT 5`
+        );
+        const sampleValues = sampleValuesRows.map((r) => r.val);
+
+        const nullRate =
+          statsRowCount > 0 ? Math.round((sampleNullCount / statsRowCount) * 10000) / 100 : 0;
+        const nullCount = useSampleStats
+          ? scaleNullCountFromSample(sampleNullCount, statsRowCount, totalRows)
+          : sampleNullCount;
+
+        return {
+          columnName,
+          dataType: String(col.data_type),
+          nullRate,
+          nullCount,
+          uniqueCount,
+          sampleValues,
+        } satisfies ColumnStats;
+      }
+    );
+
     const issues: DetectedIssue[] = [];
-
-    for (const col of columnsResult.rows) {
-      const columnName = String(col.column_name);
-      schemaInfo.push({
-        name: columnName,
-        type: String(col.data_type),
-        nullable: col.is_nullable === "YES",
-        defaultValue: col.column_default ? String(col.column_default) : undefined,
-        maxLength: col.character_maximum_length
-          ? Number(col.character_maximum_length)
-          : undefined,
-      });
-
-      const nullResult = await client.query(
-        metricCollector.buildCountSql("null_count", columnName)
-      );
-      const nullCount = Number(nullResult.rows[0]?.cnt) || 0;
-
-      const uniqueResult = await client.query(
-        metricCollector.buildCountSql("distinct_count", columnName)
-      );
-      const uniqueCount = Number(uniqueResult.rows[0]?.cnt) || 0;
-
-      const quotedCol = postgresDialect.quoteIdentifier(columnName);
-      const sampleValuesResult = await client.query(
-        `SELECT DISTINCT ${quotedCol} AS val FROM ${quotedTable} WHERE ${quotedCol} IS NOT NULL LIMIT 5`
-      );
-      const sampleValues = sampleValuesResult.rows.map(
-        (r) => r.val as string | number | null
-      );
-
-      const nullRate = totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0;
-
-      columnStats.push({
-        columnName,
-        dataType: String(col.data_type),
-        nullRate,
-        nullCount,
-        uniqueCount,
-        sampleValues,
-      });
-
-      if (nullRate > 5) {
+    for (const stat of columnStats) {
+      if (stat.nullRate > 5) {
         issues.push({
-          id: `issue_null_${columnName}`,
-          column: columnName,
+          id: `issue_null_${stat.columnName}`,
+          column: stat.columnName,
           issueType: "空值过多",
-          severity: nullRate > 30 ? "high" : "medium",
-          affectedRows: nullCount,
-          affectedPercent: parseFloat(nullRate.toFixed(2)),
-          description: `列 "${columnName}" 空值率为 ${nullRate}%`,
-          suggestion: nullRate > 50 ? "建议删除该列或使用默认值填充" : "建议使用合适的值填充空值",
+          severity: stat.nullRate > 30 ? "high" : "medium",
+          affectedRows: stat.nullCount,
+          affectedPercent: parseFloat(stat.nullRate.toFixed(2)),
+          description: `列 "${stat.columnName}" 空值率为 ${stat.nullRate}%`,
+          suggestion:
+            stat.nullRate > 50 ? "建议删除该列或使用默认值填充" : "建议使用合适的值填充空值",
         });
       }
 
       if (
-        isIdLikeColumn(columnName) &&
-        uniqueCount < totalRows &&
-        nullCount === 0
+        isIdLikeColumn(stat.columnName) &&
+        stat.uniqueCount < totalRows &&
+        stat.nullCount === 0
       ) {
-        const dupCount = totalRows - uniqueCount;
+        const dupCount = totalRows - stat.uniqueCount;
         issues.push({
-          id: `issue_dup_${columnName}`,
-          column: columnName,
+          id: `issue_dup_${stat.columnName}`,
+          column: stat.columnName,
           issueType: "唯一键重复",
           severity: dupCount > totalRows * 0.01 ? "high" : "medium",
           affectedRows: dupCount,
           affectedPercent: parseFloat(((dupCount / totalRows) * 100).toFixed(2)),
-          description: `唯一标识列 "${columnName}" 存在 ${dupCount} 个重复值`,
+          description: `唯一标识列 "${stat.columnName}" 存在 ${dupCount} 个重复值`,
           suggestion: "建议检查主键/唯一约束或处理重复 ID",
         });
       }
@@ -205,13 +307,18 @@ async function explorePostgresTable(
       sourceType: "postgresql",
       sourceName: `${config.database}.${safeTable}`,
       totalRows,
-      totalCols: columnsResult.rows.length,
+      totalCols: columnsResult.length,
       schema: schemaInfo,
-      sampleData: sampleResult.rows.slice(0, 10) as Record<string, unknown>[],
+      sampleData: sampleRows.slice(0, 10),
       columnStats,
       sampleSize: Math.min(safeLimit, totalRows),
       issues,
+      sampleBasedStats: useSampleStats,
+      rowCountApproximate,
     };
+    } catch (error) {
+      throw mapExploreQueryError(error);
+    }
   });
 }
 
@@ -242,11 +349,10 @@ export const postgresDataSourcePlugin: DataSourcePlugin = {
     if (!options.tableName) {
       throw new Error("PostgreSQL 探查需要 tableName");
     }
-    return explorePostgresTable(
-      config,
-      options.tableName,
-      options.limit ?? 100
-    );
+    return explorePostgresTable(config, options.tableName, options.limit ?? 100, {
+      exactRowCount: options.exactRowCount,
+      onProgress: options.onProgress,
+    });
   },
 
   async execute(config: DBConnectionConfig, options: ExecuteOptions) {

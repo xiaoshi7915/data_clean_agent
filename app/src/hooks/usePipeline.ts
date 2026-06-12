@@ -143,7 +143,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
   );
 
   const startExploration = useCallback(
-    async (tableName?: string) => {
+    async (tableName?: string, options?: { exactRowCount?: boolean }) => {
       if (!dataSource || !sessionId || !ensureWritable()) return;
       setIsLoading(true);
       setError(null);
@@ -155,7 +155,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
           dataSource,
           tableName ?? targetTable,
           { exploreDb, exploreFile },
-          writeRunIndex
+          writeRunIndex,
+          options
         );
         setTargetTable(resolvedTable);
         setExplorationResult(exploration);
@@ -314,7 +315,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
 
   const runAutoExploreAndAnalyze = useCallback(
     async (
-      tableName?: string
+      tableName?: string,
+      options?: { exactRowCount?: boolean }
     ): Promise<{ exploration: typeof explorationResult; report: typeof qualityReport } | null> => {
       if (!dataSource || !sessionId || !ensureWritable()) return null;
 
@@ -329,7 +331,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
           dataSource,
           tableName ?? targetTable,
           { exploreDb, exploreFile },
-          writeRunIndex
+          writeRunIndex,
+          options
         );
         setTargetTable(resolvedTable);
         setExplorationResult(exploration);
@@ -397,8 +400,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
   );
 
   const runFullPipelineToSQL = useCallback(
-    async (tableName?: string): Promise<boolean> => {
-      const result = await runAutoExploreAndAnalyze(tableName);
+    async (tableName?: string, options?: { exactRowCount?: boolean }): Promise<boolean> => {
+      const result = await runAutoExploreAndAnalyze(tableName, options);
       return result != null;
     },
     [runAutoExploreAndAnalyze]
@@ -406,7 +409,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
 
   /** 一键生成 SQL：探查 → 分析 → 自动确认规则 → 生成 SQL（不执行） */
   const runPipelineToGenerateSQL = useCallback(
-    async (tableName?: string): Promise<boolean> => {
+    async (tableName?: string, options?: { exactRowCount?: boolean }): Promise<boolean> => {
       if (!dataSource || !sessionId || !ensureWritable()) return false;
 
       setIsPipelineRunning(true);
@@ -420,7 +423,8 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
           dataSource,
           tableName ?? targetTable,
           { exploreDb, exploreFile },
-          writeRunIndex
+          writeRunIndex,
+          options
         );
         setTargetTable(resolvedTable);
         setExplorationResult(exploration);
@@ -645,15 +649,45 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
     setError(null);
 
     try {
-      const result = await batchDatabaseMut.mutateAsync({
+      const submit = await batchDatabaseMut.mutateAsync({
         sessionId,
         maxTables: 10,
       });
-      if (!result.success || !result.result) {
-        throw new Error(result.error || "整库批量失败");
+      if (!submit.success || !submit.jobId) {
+        throw new Error(submit.error || "整库批量提交失败");
       }
 
-      const { processed, totalTables, results } = result.result;
+      const jobId = submit.jobId;
+      pushMessage(
+        sessionId,
+        "agent",
+        `📦 整库批量任务已提交（job: \`${jobId.slice(0, 8)}…\`），后台处理中…`,
+        "generate"
+      );
+
+      let job = null as Awaited<ReturnType<typeof utils.batch.getBatchJobStatus.fetch>>["job"];
+      const deadline = Date.now() + 30 * 60 * 1000;
+      while (Date.now() < deadline) {
+        const statusRes = await utils.batch.getBatchJobStatus.fetch({ jobId });
+        if (!statusRes.success || !statusRes.job) {
+          throw new Error(statusRes.error || "批量任务状态查询失败");
+        }
+        job = statusRes.job;
+        if (job.status === "completed" || job.status === "failed") break;
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+
+      if (!job || job.status === "pending" || job.status === "running") {
+        throw new Error("批量任务超时，请稍后重试");
+      }
+      if (job.status === "failed") {
+        throw new Error(job.error || "整库批量失败");
+      }
+      if (!job.result) {
+        throw new Error("批量任务完成但缺少结果");
+      }
+
+      const { processed, totalTables, results } = job.result;
       const okCount = results.filter((r) => r.success).length;
       const lines = results
         .slice(0, 8)
@@ -688,6 +722,7 @@ export function usePipeline(state: CleaningSessionState, chat: ChatApi) {
     dataSource,
     ensureWritable,
     batchDatabaseMut,
+    utils,
     pushMessage,
     refreshLists,
     setError,

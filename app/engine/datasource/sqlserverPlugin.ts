@@ -20,6 +20,12 @@ import {
   buildColumnStat,
   buildColumnInfo,
 } from "./dbExploreShared";
+import {
+  buildSampleStatsFromClause,
+  scaleNullCountFromSample,
+  shouldUseApproximateRowCount,
+  shouldUseSampleStats,
+} from "./dbExploreSampling";
 
 /** 构建 SQL Server 连接配置 */
 function buildMssqlConfig(config: DBConnectionConfig): sql.config {
@@ -114,8 +120,35 @@ async function exploreSqlServerTable(
       (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
     );
 
-    const countResult = await pool.request().query(metricCollector.buildCountSql("row_count"));
-    const totalRows = Number(countResult.recordset[0]?.cnt) || 0;
+    const estimateResult = await pool
+      .request()
+      .input("schema", sql.VarChar, schema)
+      .input("table", sql.VarChar, safeTable)
+      .query(
+        `SELECT COALESCE(SUM(p.rows), 0) AS row_est
+         FROM sys.tables t
+         INNER JOIN sys.schemas s ON s.schema_id = t.schema_id
+         INNER JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0, 1)
+         WHERE s.name = @schema AND t.name = @table`
+      );
+    const rowEstimate = Number(estimateResult.recordset[0]?.row_est) || 0;
+
+    let totalRows: number;
+    let rowCountApproximate = false;
+
+    if (shouldUseApproximateRowCount(rowEstimate)) {
+      totalRows = rowEstimate;
+      rowCountApproximate = true;
+    } else {
+      const countResult = await pool.request().query(metricCollector.buildCountSql("row_count"));
+      totalRows = Number(countResult.recordset[0]?.cnt) || 0;
+    }
+
+    const useSampleStats = shouldUseSampleStats(totalRows);
+    const statsFrom = useSampleStats
+      ? buildSampleStatsFromClause("sqlserver", quotedTable, safeLimit)
+      : quotedTable;
+    const statsRowCount = useSampleStats ? Math.min(safeLimit, totalRows) : totalRows;
 
     const sampleResult = await pool.request().query(`SELECT TOP ${safeLimit} * FROM ${quotedTable}`);
 
@@ -135,21 +168,32 @@ async function exploreSqlServerTable(
         )
       );
 
-      const nullResult = await pool.request().query(metricCollector.buildCountSql("null_count", columnName));
-      const nullCount = Number(nullResult.recordset[0]?.cnt) || 0;
+      const quotedCol = sqlserverDialect.quoteIdentifier(columnName);
 
-      const uniqueResult = await pool
-        .request()
-        .query(metricCollector.buildCountSql("distinct_count", columnName));
+      const nullResult = await pool.request().query(
+        useSampleStats
+          ? `SELECT SUM(CASE WHEN ${quotedCol} IS NULL THEN 1 ELSE 0 END) AS cnt FROM ${statsFrom}`
+          : metricCollector.buildCountSql("null_count", columnName)
+      );
+      const sampleNullCount = Number(nullResult.recordset[0]?.cnt) || 0;
+
+      const uniqueResult = await pool.request().query(
+        useSampleStats
+          ? `SELECT COUNT(DISTINCT ${quotedCol}) AS cnt FROM ${statsFrom}`
+          : metricCollector.buildCountSql("distinct_count", columnName)
+      );
       const uniqueCount = Number(uniqueResult.recordset[0]?.cnt) || 0;
 
-      const quotedCol = sqlserverDialect.quoteIdentifier(columnName);
       const sampleValuesResult = await pool.request().query(
-        `SELECT DISTINCT TOP 5 ${quotedCol} AS val FROM ${quotedTable} WHERE ${quotedCol} IS NOT NULL`
+        `SELECT DISTINCT TOP 5 ${quotedCol} AS val FROM ${statsFrom} WHERE ${quotedCol} IS NOT NULL`
       );
       const sampleValues = sampleValuesResult.recordset.map(
         (r: { val: string | number | null }) => r.val as string | number | null
       );
+
+      const nullCount = useSampleStats
+        ? scaleNullCountFromSample(sampleNullCount, statsRowCount, totalRows)
+        : sampleNullCount;
 
       columnStats.push(
         buildColumnStat(
@@ -176,6 +220,8 @@ async function exploreSqlServerTable(
       columnStats,
       sampleSize: Math.min(safeLimit, totalRows),
       issues,
+      sampleBasedStats: useSampleStats,
+      rowCountApproximate,
     };
   });
 }

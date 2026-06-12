@@ -126,6 +126,10 @@ export interface ExplorationResult {
   columnStats: ColumnStats[];
   sampleSize: number;
   issues: DetectedIssue[];
+  /** 列统计基于样本估算（大表/大文件探查） */
+  sampleBasedStats?: boolean;
+  /** totalRows 来自 catalog/行数估算，非精确 COUNT */
+  rowCountApproximate?: boolean;
 }
 
 // ---- Quality Analysis ----
@@ -215,6 +219,12 @@ export interface SQLGenerationOptions {
   sourceWhereClause?: string;
   /** 是否生成问题表 `{table}_err` 步骤 */
   emitProblemTable?: boolean;
+  /** 探查列统计是否基于样本（写入 SQL 注释） */
+  explorationSampleBased?: boolean;
+  /** 探查行数是否为估算值（写入 SQL 注释） */
+  explorationRowCountApproximate?: boolean;
+  /** 探查样本行数 */
+  explorationSampleSize?: number;
 }
 
 export interface SQLGenerationResult {

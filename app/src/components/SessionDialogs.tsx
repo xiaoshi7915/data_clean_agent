@@ -40,8 +40,8 @@ interface SessionDialogsProps {
   dataSource: DataSourceConfig | null;
   targetTable: string;
   onSelectTable: (table: string) => void;
-  onExplore: (table: string) => void;
-  onRunFullPipeline?: (table: string) => void | Promise<void>;
+  onExplore: (table: string, options?: { exactRowCount?: boolean }) => void;
+  onRunFullPipeline?: (table: string, options?: { exactRowCount?: boolean }) => void | Promise<void>;
   /** 选表面板探查按钮文案（开始探查 / 重新探查） */
   tableExploreButtonLabel?: string;
   explorationResult: ExplorationResult | null;
@@ -130,13 +130,13 @@ export function SessionDialogs({
               selectedTable={targetTable}
               onSelectTable={onSelectTable}
               exploreButtonLabel={tableExploreButtonLabel}
-              onExplore={(table) => {
-                onExplore(table);
+              onExplore={(table, options) => {
+                onExplore(table, options);
                 onClose();
               }}
-              onRunFullPipeline={async (table) => {
+              onRunFullPipeline={async (table, options) => {
                 if (onRunFullPipeline) {
-                  await onRunFullPipeline(table);
+                  await onRunFullPipeline(table, options);
                   onClose();
                 }
               }}

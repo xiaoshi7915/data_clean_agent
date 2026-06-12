@@ -35,4 +35,6 @@ export const env = {
   scriptOnly: !allowExecute,
   /** 外部校验失败后的最大修复轮次（默认 3） */
   maxRepairRounds: Number(process.env.MAX_REPAIR_ROUNDS ?? "3"),
+  /** 探查 SQL 查询超时（毫秒，默认 60000） */
+  exploreQueryTimeoutMs: Number(process.env.EXPLORE_QUERY_TIMEOUT_MS ?? "60000"),
 };

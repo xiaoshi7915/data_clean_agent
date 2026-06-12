@@ -1,4 +1,5 @@
 import { exploreDatabase, exploreFile } from "../services/dataSourceService";
+import type { ExploreProgressStep } from "../services/exploreProgressService";
 import type { AgentInput, AgentOutput, SchemaAgentOutput } from "./types";
 import type { DBConnectionConfig, DataSourceConfig } from "@contracts/types";
 
@@ -9,10 +10,16 @@ export async function runSchemaAgent(
     dbConfig?: DBConnectionConfig;
     tableName: string;
     limit?: number;
+    exactRowCount?: boolean;
+    onProgress?: (
+      step: ExploreProgressStep,
+      message: string,
+      meta?: { columnIndex?: number; columnTotal?: number }
+    ) => void;
   }
 ): Promise<AgentOutput<SchemaAgentOutput>> {
   try {
-    const { sessionId, dataSource, tableName, limit = 100 } = input;
+    const { sessionId, dataSource, tableName, limit = 100, exactRowCount, onProgress } = input;
 
     if (dataSource.fileConfig) {
       const exploration = await exploreFile(
@@ -32,7 +39,8 @@ export async function runSchemaAgent(
       dataSource.dbConfig,
       tableName,
       limit,
-      dataSource.type
+      dataSource.type,
+      { exactRowCount, onProgress }
     );
     return { success: true, data: { exploration } };
   } catch (error) {

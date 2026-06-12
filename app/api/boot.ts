@@ -93,6 +93,63 @@ app.get("/api/download", async (c) => {
   });
 });
 
+// 探查进度 SSE（与 explore.exploreDatabase mutation 通过 sessionId 关联）
+app.get("/api/explore/progress", async (c) => {
+  const sessionId = c.req.query("sessionId");
+  if (!sessionId?.trim()) {
+    return c.json({ success: false, error: "缺少 sessionId 参数" }, 400);
+  }
+
+  const { getExploreProgress, subscribeExploreProgress } = await import(
+    "./services/exploreProgressService"
+  );
+
+  const encoder = new TextEncoder();
+  let unsubscribe: (() => void) | undefined;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const send = (payload: unknown) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
+      };
+
+      const current = getExploreProgress(sessionId);
+      if (current) send(current);
+
+      unsubscribe = subscribeExploreProgress(sessionId, (event) => {
+        send(event);
+        if (event.step === "done" || event.step === "error") {
+          heartbeat && clearInterval(heartbeat);
+          unsubscribe?.();
+          controller.close();
+        }
+      });
+
+      heartbeat = setInterval(() => {
+        controller.enqueue(encoder.encode(": heartbeat\n\n"));
+      }, 15_000);
+    },
+    cancel() {
+      heartbeat && clearInterval(heartbeat);
+      unsubscribe?.();
+    },
+  });
+
+  c.req.raw.signal.addEventListener("abort", () => {
+    heartbeat && clearInterval(heartbeat);
+    unsubscribe?.();
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+    },
+  });
+});
+
 // tRPC handler
 app.use("/api/trpc/*", async (c) => {
   return fetchRequestHandler({

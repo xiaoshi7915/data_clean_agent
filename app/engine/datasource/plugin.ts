@@ -5,6 +5,8 @@ import type {
   CleaningAction,
 } from "@contracts/types";
 
+import type { ExploreProgressStep } from "../../api/services/exploreProgressService";
+
 /** 数据源插件探查参数 */
 export interface ExploreOptions {
   /** 会话 ID，供连接池复用（CLI 可用固定值如 cli） */
@@ -13,6 +15,14 @@ export interface ExploreOptions {
   limit?: number;
   filePath?: string;
   fileType?: string;
+  /** 大表是否强制执行精确 COUNT(*)（默认 false，使用 catalog 估算） */
+  exactRowCount?: boolean;
+  /** 探查阶段进度回调 */
+  onProgress?: (
+    step: ExploreProgressStep,
+    message: string,
+    meta?: { columnIndex?: number; columnTotal?: number }
+  ) => void;
 }
 
 /** 数据源插件执行参数 */

@@ -11,6 +11,9 @@ export function runRepairAgent(
     databaseName: string;
     columns?: string[];
     sourceWhereClause?: string;
+    explorationSampleBased?: boolean;
+    explorationRowCountApproximate?: boolean;
+    explorationSampleSize?: number;
   }
 ): AgentOutput<RepairAgentOutput> {
   try {
@@ -24,6 +27,9 @@ export function runRepairAgent(
       {
         sourceWhereClause: input.sourceWhereClause,
         emitProblemTable: true,
+        explorationSampleBased: input.explorationSampleBased,
+        explorationRowCountApproximate: input.explorationRowCountApproximate,
+        explorationSampleSize: input.explorationSampleSize,
       }
     );
     return { success: true, data: { sqlResult } };

@@ -20,6 +20,21 @@ import {
   buildColumnStat,
   buildColumnInfo,
 } from "./dbExploreShared";
+import {
+  buildSampleStatsFromClause,
+  scaleNullCountFromSample,
+  shouldUseApproximateRowCount,
+  shouldUseSampleStats,
+} from "./dbExploreSampling";
+import {
+  EXPLORE_COLUMN_STATS_CONCURRENCY,
+  mapWithConcurrency,
+} from "./exploreColumnStats";
+import {
+  mapExploreQueryError,
+  withExploreQueryTimeout,
+} from "../../api/lib/exploreQueryTimeout";
+import type { ExploreProgressStep } from "../../api/services/exploreProgressService";
 
 /** 构建 Oracle 连接串（database 字段为 service name 或 SID） */
 function buildOracleConnectString(config: DBConnectionConfig): string {
@@ -76,55 +91,105 @@ async function listOracleTables(config: DBConnectionConfig): Promise<DatabaseTab
   });
 }
 
+async function oracleTimedExecute<T>(
+  connection: oracledb.Connection,
+  sql: string,
+  binds?: oracledb.BindParameters
+): Promise<T> {
+  return withExploreQueryTimeout(async () => {
+    const result =
+      binds != null
+        ? await connection.execute(sql, binds, { outFormat: oracledb.OUT_FORMAT_OBJECT })
+        : await connection.execute(sql, [], { outFormat: oracledb.OUT_FORMAT_OBJECT });
+    return (result.rows ?? []) as T;
+  });
+}
+
 async function exploreOracleTable(
   config: DBConnectionConfig,
   tableName: string,
-  limit: number
+  limit: number,
+  options?: {
+    exactRowCount?: boolean;
+    onProgress?: (
+      step: ExploreProgressStep,
+      message: string,
+      meta?: { columnIndex?: number; columnTotal?: number }
+    ) => void;
+  }
 ): Promise<ExplorationResult> {
   const safeTable = sanitizeTableName(tableName).toUpperCase();
   const safeLimit = sanitizeExploreLimit(limit);
   const owner = (config.schema || config.username).toUpperCase();
   const quotedTable = `${oracleDialect.quoteIdentifier(owner)}.${oracleDialect.quoteTable(safeTable)}`;
 
+  const report = options?.onProgress;
+
   return withOracleConnection(config, async (connection) => {
-    const columnsResult = await connection.execute<{
-      COLUMN_NAME: string;
-      DATA_TYPE: string;
-      NULLABLE: string;
-      DATA_DEFAULT: string | null;
-      DATA_LENGTH: number | null;
-    }>(
-      `SELECT column_name, data_type, nullable, data_default, data_length
-       FROM all_tab_columns
-       WHERE owner = :owner AND table_name = :tableName
-       ORDER BY column_id`,
-      { owner, tableName: safeTable }
-    );
+    try {
+      report?.("connecting", "正在连接 Oracle…");
+      report?.("loading_schema", "正在读取表结构…");
+      const columnsRows = await oracleTimedExecute<{
+        COLUMN_NAME: string;
+        DATA_TYPE: string;
+        NULLABLE: string;
+        DATA_DEFAULT: string | null;
+        DATA_LENGTH: number | null;
+      }[]>(
+        connection,
+        `SELECT column_name, data_type, nullable, data_default, data_length
+         FROM all_tab_columns
+         WHERE owner = :owner AND table_name = :tableName
+         ORDER BY column_id`,
+        { owner, tableName: safeTable }
+      );
 
-    const metricCollector = new ExplorationMetricCollector(
-      oracleDialect,
-      safeTable,
-      (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
-    );
+      const metricCollector = new ExplorationMetricCollector(
+        oracleDialect,
+        safeTable,
+        (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
+      );
 
-    const countResult = await connection.execute<{ CNT: number }>(
-      metricCollector.buildCountSql("row_count")
-    );
-    const totalRows = Number(countResult.rows?.[0]?.CNT) || 0;
+      report?.("counting_rows", "正在统计行数…");
+      const estimateRows = await oracleTimedExecute<{ ROW_EST: number }[]>(
+        connection,
+        `SELECT NVL(num_rows, 0) AS row_est FROM all_tables WHERE owner = :owner AND table_name = :tableName`,
+        { owner, tableName: safeTable }
+      );
+      const rowEstimate = Number(estimateRows[0]?.ROW_EST) || 0;
 
-    const sampleResult = await connection.execute(
-      `SELECT * FROM ${quotedTable} FETCH FIRST ${safeLimit} ROWS ONLY`
-    );
+      let totalRows: number;
+      let rowCountApproximate = false;
 
-    const columnStats = [];
-    const schemaInfo = [];
-    const issues = [];
+      const skipExactCount =
+        shouldUseApproximateRowCount(rowEstimate) && !options?.exactRowCount;
 
-    for (const col of columnsResult.rows ?? []) {
-      const columnName = String(col.COLUMN_NAME);
-      schemaInfo.push(
+      if (skipExactCount) {
+        totalRows = rowEstimate;
+        rowCountApproximate = true;
+      } else {
+        const countRows = await oracleTimedExecute<{ CNT: number }[]>(
+          connection,
+          metricCollector.buildCountSql("row_count")
+        );
+        totalRows = Number(countRows[0]?.CNT) || 0;
+      }
+
+      const useSampleStats = shouldUseSampleStats(totalRows);
+      const statsFrom = useSampleStats
+        ? buildSampleStatsFromClause("oracle", quotedTable, safeLimit)
+        : quotedTable;
+      const statsRowCount = useSampleStats ? Math.min(safeLimit, totalRows) : totalRows;
+
+      report?.("sampling", `正在抽取样本（最多 ${safeLimit} 行）…`);
+      const sampleRows = await oracleTimedExecute<Record<string, unknown>[]>(
+        connection,
+        `SELECT * FROM ${quotedTable} FETCH FIRST ${safeLimit} ROWS ONLY`
+      );
+
+      const schemaInfo = columnsRows.map((col) =>
         buildColumnInfo(
-          columnName,
+          String(col.COLUMN_NAME),
           String(col.DATA_TYPE),
           col.NULLABLE === "Y",
           col.DATA_DEFAULT ? String(col.DATA_DEFAULT) : undefined,
@@ -132,51 +197,86 @@ async function exploreOracleTable(
         )
       );
 
-      const nullResult = await connection.execute<{ CNT: number }>(
-        metricCollector.buildCountSql("null_count", columnName)
-      );
-      const nullCount = Number(nullResult.rows?.[0]?.CNT) || 0;
+      const columnTotal = columnsRows.length;
+      const concurrency = useSampleStats ? 1 : EXPLORE_COLUMN_STATS_CONCURRENCY;
 
-      const uniqueResult = await connection.execute<{ CNT: number }>(
-        metricCollector.buildCountSql("distinct_count", columnName)
-      );
-      const uniqueCount = Number(uniqueResult.rows?.[0]?.CNT) || 0;
+      const columnStats = await mapWithConcurrency(
+        columnsRows,
+        concurrency,
+        async (col, index) => {
+          const columnName = String(col.COLUMN_NAME);
+          report?.(
+            "column_stats",
+            `列统计 ${index + 1}/${columnTotal}：${columnName}`,
+            { columnIndex: index + 1, columnTotal }
+          );
 
-      const quotedCol = oracleDialect.quoteIdentifier(columnName);
-      const sampleValuesResult = await connection.execute<{ VAL: string | number | null }>(
-        `SELECT DISTINCT ${quotedCol} AS val FROM ${quotedTable}
-         WHERE ${quotedCol} IS NOT NULL FETCH FIRST 5 ROWS ONLY`
-      );
-      const sampleValues = (sampleValuesResult.rows ?? []).map(
-        (r: { VAL: string | number | null }) => r.VAL
+          const quotedCol = oracleDialect.quoteIdentifier(columnName);
+
+          const nullRows = await oracleTimedExecute<{ CNT: number }[]>(
+            connection,
+            useSampleStats
+              ? `SELECT SUM(CASE WHEN ${quotedCol} IS NULL THEN 1 ELSE 0 END) AS cnt FROM ${statsFrom}`
+              : metricCollector.buildCountSql("null_count", columnName)
+          );
+          const sampleNullCount = Number(nullRows[0]?.CNT) || 0;
+
+          const uniqueRows = await oracleTimedExecute<{ CNT: number }[]>(
+            connection,
+            useSampleStats
+              ? `SELECT COUNT(DISTINCT ${quotedCol}) AS cnt FROM ${statsFrom}`
+              : metricCollector.buildCountSql("distinct_count", columnName)
+          );
+          const uniqueCount = Number(uniqueRows[0]?.CNT) || 0;
+
+          const sampleValuesRows = await oracleTimedExecute<{ VAL: string | number | null }[]>(
+            connection,
+            `SELECT DISTINCT ${quotedCol} AS val FROM ${statsFrom}
+             WHERE ${quotedCol} IS NOT NULL FETCH FIRST 5 ROWS ONLY`
+          );
+          const sampleValues = sampleValuesRows.map((r) => r.VAL);
+
+          const nullCount = useSampleStats
+            ? scaleNullCountFromSample(sampleNullCount, statsRowCount, totalRows)
+            : sampleNullCount;
+
+          return buildColumnStat(
+            columnName,
+            String(col.DATA_TYPE),
+            totalRows,
+            nullCount,
+            uniqueCount,
+            sampleValues
+          );
+        }
       );
 
-      columnStats.push(
-        buildColumnStat(
-          columnName,
-          String(col.DATA_TYPE),
+      const issues = columnStats.flatMap((stat) =>
+        buildColumnIssues(
+          stat.columnName,
+          stat.dataType,
           totalRows,
-          nullCount,
-          uniqueCount,
-          sampleValues
+          stat.nullCount ?? 0,
+          stat.uniqueCount
         )
       );
-      issues.push(
-        ...buildColumnIssues(columnName, String(col.DATA_TYPE), totalRows, nullCount, uniqueCount)
-      );
-    }
 
-    return {
-      sourceType: "oracle",
-      sourceName: `${owner}.${safeTable}`,
-      totalRows,
-      totalCols: columnsResult.rows?.length ?? 0,
-      schema: schemaInfo,
-      sampleData: (sampleResult.rows ?? []).slice(0, 10) as Record<string, unknown>[],
-      columnStats,
-      sampleSize: Math.min(safeLimit, totalRows),
-      issues,
-    };
+      return {
+        sourceType: "oracle",
+        sourceName: `${owner}.${safeTable}`,
+        totalRows,
+        totalCols: columnsRows.length,
+        schema: schemaInfo,
+        sampleData: sampleRows.slice(0, 10),
+        columnStats,
+        sampleSize: Math.min(safeLimit, totalRows),
+        issues,
+        sampleBasedStats: useSampleStats,
+        rowCountApproximate,
+      };
+    } catch (error) {
+      throw mapExploreQueryError(error);
+    }
   });
 }
 
@@ -207,7 +307,10 @@ export const oracleDataSourcePlugin: DataSourcePlugin = {
     if (!options.tableName) {
       throw new Error("Oracle 探查需要 tableName");
     }
-    return exploreOracleTable(config, options.tableName, options.limit ?? 100);
+    return exploreOracleTable(config, options.tableName, options.limit ?? 100, {
+      exactRowCount: options.exactRowCount,
+      onProgress: options.onProgress,
+    });
   },
 
   async execute(config: DBConnectionConfig, options: ExecuteOptions) {

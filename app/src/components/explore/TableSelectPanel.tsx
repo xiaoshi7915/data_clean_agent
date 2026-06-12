@@ -5,6 +5,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Database, FileCode2, Loader2, Search, Table2 } from "lucide-react";
 import { trpc } from "@/providers/trpc";
 import type { DataSourceConfig, DatabaseTableInfo } from "@contracts/types";
+import { EXPLORE_APPROXIMATE_COUNT_ROW_LIMIT, LARGE_TABLE_ROW_WARNING } from "@contracts/exploreLimits";
+import { useExploreProgress } from "@/hooks/useExploreProgress";
 
 function formatTableComment(comment: string): string {
   if (comment.length <= 20) return comment;
@@ -16,8 +18,8 @@ interface TableSelectPanelProps {
   sessionId?: string;
   selectedTable: string;
   onSelectTable: (table: string) => void;
-  onExplore: (table: string) => void;
-  onRunFullPipeline?: (table: string) => void | Promise<void>;
+  onExplore: (table: string, options?: { exactRowCount?: boolean }) => void;
+  onRunFullPipeline?: (table: string, options?: { exactRowCount?: boolean }) => void | Promise<void>;
   /** 探查按钮文案：新会话为「开始探查」，重试选表后为「重新探查」 */
   exploreButtonLabel?: string;
   isLoading: boolean;
@@ -43,7 +45,9 @@ export function TableSelectPanel({
   const [search, setSearch] = useState("");
   const [tables, setTables] = useState<DatabaseTableInfo[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [exactRowCount, setExactRowCount] = useState(false);
   const listTables = trpc.explore.listTables.useMutation();
+  const exploreProgress = useExploreProgress(sessionId, isLoading || isPipelineRunning);
 
   useEffect(() => {
     if (!dataSource.dbConfig) return;
@@ -87,6 +91,17 @@ export function TableSelectPanel({
   }, [search, tables]);
 
   const loadingTables = listTables.isPending;
+
+  const selectedTableInfo = useMemo(
+    () => tables.find((t) => t.name === selectedTable),
+    [tables, selectedTable]
+  );
+  const showLargeTableWarning =
+    selectedTableInfo != null && selectedTableInfo.rowCount >= LARGE_TABLE_ROW_WARNING;
+  const showExactCountOption =
+    selectedTableInfo != null &&
+    selectedTableInfo.rowCount >= EXPLORE_APPROXIMATE_COUNT_ROW_LIMIT;
+  const exploreOptions = { exactRowCount: exactRowCount && showExactCountOption };
 
   return (
     <div className={`flex flex-col gap-6 w-full ${embedded ? "" : "items-center justify-center h-full px-6 max-w-xl mx-auto"}`}>
@@ -158,6 +173,7 @@ export function TableSelectPanel({
                         }`}
                       >
                         · {table.rowCount.toLocaleString()}行
+                        <span className="text-[10px] opacity-70">（估算）</span>
                       </span>
                     </div>
                     {table.comment && (
@@ -174,19 +190,50 @@ export function TableSelectPanel({
             </div>
           )}
         </ScrollArea>
+
+        {showLargeTableWarning && (
+          <p className="text-sm text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-md px-3 py-2">
+            该表约 {selectedTableInfo!.rowCount.toLocaleString()} 行（估算），探查时将优先使用 catalog 行数与样本统计，避免全表 COUNT；超过{" "}
+            {LARGE_TABLE_ROW_WARNING.toLocaleString()} 行时列统计基于前 100 行样本估算。
+          </p>
+        )}
+
+        {showExactCountOption && (
+          <label className="flex items-start gap-2 text-sm text-muted-foreground cursor-pointer">
+            <input
+              type="checkbox"
+              className="mt-1"
+              checked={exactRowCount}
+              onChange={(e) => setExactRowCount(e.target.checked)}
+              disabled={isLoading || isPipelineRunning}
+            />
+            <span>
+              精确计数（执行 COUNT(*)，大表可能较慢或超时；默认使用 catalog 估算行数）
+            </span>
+          </label>
+        )}
+
+        {(isLoading || isPipelineRunning) && exploreProgress && (
+          <p className="text-sm text-sky-800 dark:text-sky-200 bg-sky-50 dark:bg-sky-950/30 border border-sky-200 dark:border-sky-800 rounded-md px-3 py-2">
+            {exploreProgress.message}
+            {exploreProgress.columnIndex != null && exploreProgress.columnTotal != null
+              ? ` (${exploreProgress.columnIndex}/${exploreProgress.columnTotal})`
+              : ""}
+          </p>
+        )}
       </div>
 
       <div className="flex w-full gap-2">
         <Button
           variant="outline"
-          onClick={() => selectedTable && onExplore(selectedTable)}
+          onClick={() => selectedTable && onExplore(selectedTable, exploreOptions)}
           disabled={isLoading || isPipelineRunning || loadingTables || !selectedTable}
           className={footerButtonClassName}
         >
           {isLoading && !isPipelineRunning ? (
             <span className="flex items-center gap-2">
               <Loader2 className="w-4 h-4 animate-spin" />
-              探查中...
+              {showLargeTableWarning ? "大表抽样探查中..." : "探查中..."}
             </span>
           ) : (
             exploreButtonLabel
@@ -195,14 +242,14 @@ export function TableSelectPanel({
         {onRunFullPipeline && (
           <Button
             variant="outline"
-            onClick={() => selectedTable && onRunFullPipeline(selectedTable)}
+            onClick={() => selectedTable && onRunFullPipeline(selectedTable, exploreOptions)}
             disabled={isLoading || isPipelineRunning || loadingTables || !selectedTable}
             className={footerButtonClassName}
           >
             {isPipelineRunning ? (
               <span className="flex items-center gap-2">
                 <Loader2 className="w-4 h-4 animate-spin" />
-                生成中...
+                {showLargeTableWarning ? "大表抽样生成中..." : "生成中..."}
               </span>
             ) : (
               <>

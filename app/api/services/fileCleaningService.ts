@@ -1,10 +1,12 @@
 import path from "node:path";
 import {
   cleanedFileName,
+  estimateFileRowCount,
   getUploadPath,
   loadFullFileData,
   writeCleanedFile,
 } from "./dataSourceService";
+import { EXPLORE_SAMPLE_LIMIT, FILE_EXPLORE_FULL_SCAN_ROW_LIMIT } from "@contracts/exploreLimits";
 import { resolveRuleVariant } from "./analysisService";
 import type { CleaningRule, ExecutionResult, FileType, QualityScore } from "@contracts/types";
 import {
@@ -689,8 +691,13 @@ export async function executeFileCleaning(
   const startedAt = new Date().toISOString();
 
   try {
-    const loaded = await loadFullFileData(filePath, fileType);
-    const originalCount = loaded.rows.length;
+    const estimatedTotal = await estimateFileRowCount(filePath, fileType);
+    const useSampleForDryRun =
+      dryRun && estimatedTotal > FILE_EXPLORE_FULL_SCAN_ROW_LIMIT;
+    const loaded = await loadFullFileData(filePath, fileType, {
+      maxRows: useSampleForDryRun ? EXPLORE_SAMPLE_LIMIT : undefined,
+    });
+    const originalCount = loaded.estimatedTotalRows ?? loaded.rows.length;
 
     const confirmedRules = rules.filter((r) => r.status === "confirmed");
     const applyResult =
@@ -748,7 +755,7 @@ export async function executeFileCleaning(
       stepResults: [
         {
           stepNumber: 0,
-          name: dryRun ? "模拟读取源文件" : "读取源文件",
+          name: useSampleForDryRun ? "模拟读取源文件（抽样）" : dryRun ? "模拟读取源文件" : "读取源文件",
           status: "success",
           affectedRows: originalCount,
           durationMs: 0,

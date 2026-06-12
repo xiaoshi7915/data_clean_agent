@@ -12,7 +12,17 @@ import {
   createOracleExecutor,
   type SqlExecutor,
 } from "../../engine/execution/sqlExecutor";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  openSync,
+  readSync,
+  closeSync,
+  createReadStream,
+} from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
 import { env } from "../lib/env";
 import Papa from "papaparse";
@@ -33,7 +43,28 @@ import { ExplorationMetricCollector } from "../../engine/metrics/metricSqlBuilde
 import { mysqlDialect } from "../../engine/sql/mysqlDialect";
 import { getDataSourcePlugin } from "../../engine/datasource/plugin";
 import { unsupportedDbMessage } from "@contracts/dataSourceSupport";
+import {
+  EXPLORE_SAMPLE_LIMIT,
+  FILE_EXPLORE_FULL_SCAN_ROW_LIMIT,
+} from "@contracts/exploreLimits";
 import { resolveExistingUploadPath } from "./uploadPathService";
+
+export { EXPLORE_FULL_SCAN_ROW_LIMIT, EXPLORE_SAMPLE_LIMIT } from "@contracts/exploreLimits";
+import {
+  buildSampleStatsFromClause,
+  scaleNullCountFromSample,
+  shouldUseApproximateRowCount,
+  shouldUseSampleStats,
+} from "../../engine/datasource/dbExploreSampling";
+import {
+  EXPLORE_COLUMN_STATS_CONCURRENCY,
+  mapWithConcurrency,
+} from "../../engine/datasource/exploreColumnStats";
+import {
+  mapExploreQueryError,
+  withExploreQueryTimeout,
+} from "../lib/exploreQueryTimeout";
+import type { ExploreProgressStep } from "./exploreProgressService";
 import "../../engine/datasource/mysqlPlugin";
 import "../../engine/datasource/postgresPlugin";
 import "../../engine/datasource/sqlitePlugin";
@@ -298,8 +329,8 @@ function sanitizeTableName(name: string): string {
 }
 
 function sanitizeLimit(limit: number): number {
-  const value = Math.floor(Number(limit) || 100);
-  return Math.max(1, Math.min(value, 100));
+  const value = Math.floor(Number(limit) || EXPLORE_SAMPLE_LIMIT);
+  return Math.max(1, Math.min(value, EXPLORE_SAMPLE_LIMIT));
 }
 
 function quoteIdentifier(name: string): string {
@@ -366,168 +397,265 @@ export async function listDatabaseTables(
   throw new Error(unsupportedDbMessage(String(dbType)));
 }
 
+export interface ExploreDatabaseOptions {
+  /** 大表是否强制执行精确 COUNT(*) */
+  exactRowCount?: boolean;
+  onProgress?: (
+    step: ExploreProgressStep,
+    message: string,
+    meta?: { columnIndex?: number; columnTotal?: number }
+  ) => void;
+}
+
+async function mysqlTimedQuery<T>(
+  pool: mysql.Pool,
+  sql: string,
+  params?: unknown[]
+): Promise<T> {
+  return withExploreQueryTimeout(async () => {
+    const [rows] = await pool.query(sql, params);
+    return rows as T;
+  });
+}
+
 export async function exploreDatabase(
   sessionId: string,
   config: DBConnectionConfig,
   tableName: string,
   limit: number = 100,
-  dbType: DataSourceType | string = "mysql"
+  dbType: DataSourceType | string = "mysql",
+  options?: ExploreDatabaseOptions
 ): Promise<ExplorationResult> {
   const plugin = getDataSourcePlugin(dbType);
   if (plugin && dbType !== "mysql") {
-    return plugin.explore(config, { sessionId, tableName, limit });
+    return plugin.explore(config, {
+      sessionId,
+      tableName,
+      limit,
+      exactRowCount: options?.exactRowCount,
+      onProgress: options?.onProgress,
+    });
   }
 
+  const report = options?.onProgress;
   const safeTable = sanitizeTableName(tableName);
   const safeLimit = sanitizeLimit(limit);
   const quotedTable = quoteIdentifier(safeTable);
-  const pool = await createConnection(sessionId, config);
 
-  // Get schema
-  const [columns] = await pool.execute(
-    `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT,
-            CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE
-     FROM INFORMATION_SCHEMA.COLUMNS
-     WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-     ORDER BY ORDINAL_POSITION`,
-    [config.database, safeTable]
-  );
+  try {
+    report?.("connecting", "正在连接数据库…");
+    const pool = await createConnection(sessionId, config);
 
-  // 通过 MetricRegistry 生成行数 SQL，避免与质量报告侧重复定义
-  const metricCollector = new ExplorationMetricCollector(
-    mysqlDialect,
-    safeTable,
-    (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
-  );
-  const [countRows] = await pool.query(metricCollector.buildCountSql("row_count"));
-  const totalRows = (countRows as { cnt: number }[])[0]?.cnt || 0;
+    report?.("loading_schema", "正在读取表结构…");
+    const columns = await mysqlTimedQuery<
+      Array<{
+        COLUMN_NAME: string;
+        DATA_TYPE: string;
+        IS_NULLABLE: string;
+        COLUMN_DEFAULT: string | null;
+        COLUMN_COMMENT: string | null;
+        CHARACTER_MAXIMUM_LENGTH: number | null;
+      }>
+    >(
+      pool,
+      `SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_COMMENT,
+              CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE
+       FROM INFORMATION_SCHEMA.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+       ORDER BY ORDINAL_POSITION`,
+      [config.database, safeTable]
+    );
 
-  // LIMIT 不能用预处理占位符，MySQL 会报 mysqld_stmt_execute 参数错误
-  const [sampleRows] = await pool.query(
-    `SELECT * FROM ${quotedTable} LIMIT ${safeLimit}`
-  );
+    const metricCollector = new ExplorationMetricCollector(
+      mysqlDialect,
+      safeTable,
+      (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
+    );
 
-  // Get column stats
-  const dbColumns = columns as Array<{
-    COLUMN_NAME: string;
-    DATA_TYPE: string;
-    IS_NULLABLE: string;
-    COLUMN_DEFAULT: string | null;
-    CHARACTER_MAXIMUM_LENGTH: number | null;
-  }>;
+    report?.("counting_rows", "正在统计行数…");
+    const tableMetaRows = await mysqlTimedQuery<{ TABLE_ROWS: number }[]>(
+      pool,
+      `SELECT TABLE_ROWS FROM INFORMATION_SCHEMA.TABLES
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`,
+      [config.database, safeTable]
+    );
+    const tableRowsEstimate = Number(tableMetaRows[0]?.TABLE_ROWS) || 0;
 
-  const columnStats: ColumnStats[] = [];
-  const schema: ColumnInfo[] = [];
-  const issues: DetectedIssue[] = [];
+    let totalRows: number;
+    let rowCountApproximate = false;
 
-  for (const col of dbColumns) {
-    schema.push({
+    const skipExactCount =
+      shouldUseApproximateRowCount(tableRowsEstimate) && !options?.exactRowCount;
+
+    if (skipExactCount) {
+      totalRows = tableRowsEstimate;
+      rowCountApproximate = true;
+    } else {
+      const countRows = await mysqlTimedQuery<{ cnt: number }[]>(
+        pool,
+        metricCollector.buildCountSql("row_count")
+      );
+      totalRows = countRows[0]?.cnt || 0;
+      if (options?.exactRowCount && shouldUseApproximateRowCount(tableRowsEstimate)) {
+        rowCountApproximate = false;
+      }
+    }
+
+    const useSampleStats = shouldUseSampleStats(totalRows);
+    const statsFrom = useSampleStats
+      ? buildSampleStatsFromClause("mysql", quotedTable, safeLimit)
+      : quotedTable;
+    const statsRowCount = useSampleStats ? Math.min(safeLimit, totalRows) : totalRows;
+
+    report?.("sampling", `正在抽取样本（最多 ${safeLimit} 行）…`);
+    const sampleRows = await mysqlTimedQuery<Record<string, unknown>[]>(
+      pool,
+      `SELECT * FROM ${quotedTable} LIMIT ${safeLimit}`
+    );
+
+    const dbColumns = columns;
+    const schema: ColumnInfo[] = dbColumns.map((col) => ({
       name: col.COLUMN_NAME,
       type: col.DATA_TYPE,
       nullable: col.IS_NULLABLE === "YES",
       defaultValue: col.COLUMN_DEFAULT || undefined,
       maxLength: col.CHARACTER_MAXIMUM_LENGTH || undefined,
-    });
+    }));
 
-    const quotedCol = quoteIdentifier(col.COLUMN_NAME);
-    const [nullResult] = await pool.query(
-      metricCollector.buildCountSql("null_count", col.COLUMN_NAME)
+    const columnTotal = dbColumns.length;
+    const concurrency = useSampleStats ? 1 : EXPLORE_COLUMN_STATS_CONCURRENCY;
+
+    const columnStats = await mapWithConcurrency(
+      dbColumns,
+      concurrency,
+      async (col, index) => {
+        report?.(
+          "column_stats",
+          `列统计 ${index + 1}/${columnTotal}：${col.COLUMN_NAME}`,
+          { columnIndex: index + 1, columnTotal }
+        );
+
+        const quotedCol = quoteIdentifier(col.COLUMN_NAME);
+        const nullResult = await mysqlTimedQuery<{ cnt: number }[]>(
+          pool,
+          useSampleStats
+            ? `SELECT SUM(CASE WHEN ${quotedCol} IS NULL THEN 1 ELSE 0 END) AS cnt FROM ${statsFrom}`
+            : metricCollector.buildCountSql("null_count", col.COLUMN_NAME)
+        );
+        const sampleNullCount = Number(nullResult[0]?.cnt) || 0;
+
+        const uniqueResult = await mysqlTimedQuery<{ cnt: number }[]>(
+          pool,
+          useSampleStats
+            ? `SELECT COUNT(DISTINCT ${quotedCol}) AS cnt FROM ${statsFrom}`
+            : metricCollector.buildCountSql("distinct_count", col.COLUMN_NAME)
+        );
+        const uniqueCount = Number(uniqueResult[0]?.cnt) || 0;
+
+        const sampleResult = await mysqlTimedQuery<{ val: unknown }[]>(
+          pool,
+          `SELECT DISTINCT ${quotedCol} as val FROM ${statsFrom} WHERE ${quotedCol} IS NOT NULL LIMIT 5`
+        );
+        const sampleValues = sampleResult.map((r) => r.val as string | number | null);
+
+        const nullRate =
+          statsRowCount > 0 ? Math.round((sampleNullCount / statsRowCount) * 10000) / 100 : 0;
+        const nullCount = useSampleStats
+          ? scaleNullCountFromSample(sampleNullCount, statsRowCount, totalRows)
+          : sampleNullCount;
+
+        return {
+          columnName: col.COLUMN_NAME,
+          dataType: col.DATA_TYPE,
+          nullRate,
+          nullCount,
+          uniqueCount,
+          sampleValues,
+        } satisfies ColumnStats;
+      }
     );
-    const nullCount = Number((nullResult as { cnt: number }[])[0]?.cnt) || 0;
 
-    const [uniqueResult] = await pool.query(
-      metricCollector.buildCountSql("distinct_count", col.COLUMN_NAME)
-    );
-    const uniqueCount = Number((uniqueResult as { cnt: number }[])[0]?.cnt) || 0;
+    const issues: DetectedIssue[] = [];
+    for (let i = 0; i < columnStats.length; i++) {
+      const stat = columnStats[i];
+      const colName = stat.columnName;
 
-    // Get sample values
-    const [sampleResult] = await pool.query(
-      `SELECT DISTINCT ${quotedCol} as val FROM ${quotedTable} WHERE ${quotedCol} IS NOT NULL LIMIT 5`
-    );
-    const sampleValues = (sampleResult as { val: unknown }[]).map((r) => r.val as string | number | null);
+      if (stat.nullRate > 5) {
+        issues.push({
+          id: `issue_null_${colName}`,
+          column: colName,
+          issueType: "空值过多",
+          severity: stat.nullRate > 30 ? "high" : "medium",
+          affectedRows: stat.nullCount,
+          affectedPercent: parseFloat(stat.nullRate.toFixed(2)),
+          description: `列 "${colName}" 空值率为 ${stat.nullRate}%`,
+          suggestion:
+            stat.nullRate > 50 ? "建议删除该列或使用默认值填充" : "建议使用合适的值填充空值",
+        });
+      }
 
-    const nullRate = totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0;
-
-    columnStats.push({
-      columnName: col.COLUMN_NAME,
-      dataType: col.DATA_TYPE,
-      nullRate,
-      nullCount,
-      uniqueCount,
-      sampleValues,
-    });
-
-    // Detect issues
-    if (nullRate > 5) {
-      issues.push({
-        id: `issue_null_${col.COLUMN_NAME}`,
-        column: col.COLUMN_NAME,
-        issueType: "空值过多",
-        severity: nullRate > 30 ? "high" : "medium",
-        affectedRows: nullCount,
-        affectedPercent: parseFloat(nullRate.toFixed(2)),
-        description: `列 "${col.COLUMN_NAME}" 空值率为 ${nullRate}%`,
-        suggestion: nullRate > 50 ? "建议删除该列或使用默认值填充" : "建议使用合适的值填充空值",
-      });
+      if (
+        isIdLikeColumn(colName) &&
+        stat.uniqueCount < totalRows &&
+        stat.nullCount === 0
+      ) {
+        const dupCount = totalRows - stat.uniqueCount;
+        issues.push({
+          id: `issue_dup_${colName}`,
+          column: colName,
+          issueType: "唯一键重复",
+          severity: dupCount > totalRows * 0.01 ? "high" : "medium",
+          affectedRows: dupCount,
+          affectedPercent: parseFloat(((dupCount / totalRows) * 100).toFixed(2)),
+          description: `唯一标识列 "${colName}" 存在 ${dupCount} 个重复值`,
+          suggestion: "建议检查主键/唯一约束或处理重复 ID",
+        });
+      }
     }
 
-    // 仅对 id 类字段检测列级重复（业务上应唯一）；普通列重复是正常现象
-    if (
-      isIdLikeColumn(col.COLUMN_NAME) &&
-      uniqueCount < totalRows &&
-      nullCount === 0
-    ) {
-      const dupCount = totalRows - uniqueCount;
-      issues.push({
-        id: `issue_dup_${col.COLUMN_NAME}`,
-        column: col.COLUMN_NAME,
-        issueType: "唯一键重复",
-        severity: dupCount > totalRows * 0.01 ? "high" : "medium",
-        affectedRows: dupCount,
-        affectedPercent: parseFloat(((dupCount / totalRows) * 100).toFixed(2)),
-        description: `唯一标识列 "${col.COLUMN_NAME}" 存在 ${dupCount} 个重复值`,
-        suggestion: "建议检查主键/唯一约束或处理重复 ID",
-      });
+    if (!useSampleStats) {
+      const allColNames = dbColumns.map((c) => quoteIdentifier(c.COLUMN_NAME)).join(", ");
+      const dupResult = await mysqlTimedQuery<{ cnt: number }[]>(
+        pool,
+        `SELECT COUNT(*) as cnt FROM (
+          SELECT ${allColNames}, COUNT(*) as dup_count
+          FROM ${quotedTable}
+          GROUP BY ${allColNames}
+          HAVING COUNT(*) > 1
+        ) as duplicates`
+      );
+      const fullDupCount = dupResult[0]?.cnt || 0;
+
+      if (fullDupCount > 0) {
+        issues.push({
+          id: "issue_full_dup",
+          column: "*",
+          issueType: "完全重复行",
+          severity: "high",
+          affectedRows: fullDupCount,
+          affectedPercent: parseFloat(((fullDupCount / totalRows) * 100).toFixed(2)),
+          description: `发现 ${fullDupCount} 组完全重复的行`,
+          suggestion: "建议删除完全重复的行，保留一条",
+        });
+      }
     }
+
+    return {
+      sourceType: "mysql",
+      sourceName: `${config.database}.${safeTable}`,
+      totalRows,
+      totalCols: dbColumns.length,
+      schema,
+      sampleData: sampleRows.slice(0, 10),
+      columnStats,
+      sampleSize: Math.min(safeLimit, totalRows),
+      issues,
+      sampleBasedStats: useSampleStats,
+      rowCountApproximate,
+    };
+  } catch (error) {
+    throw mapExploreQueryError(error);
   }
-
-  // Check for fully duplicate rows
-  const allColNames = dbColumns.map((c) => quoteIdentifier(c.COLUMN_NAME)).join(", ");
-  const [dupResult] = await pool.query(
-    `SELECT COUNT(*) as cnt FROM (
-      SELECT ${allColNames}, COUNT(*) as dup_count
-      FROM ${quotedTable}
-      GROUP BY ${allColNames}
-      HAVING COUNT(*) > 1
-    ) as duplicates`
-  );
-  const fullDupCount = (dupResult as { cnt: number }[])[0]?.cnt || 0;
-
-  if (fullDupCount > 0) {
-    issues.push({
-      id: "issue_full_dup",
-      column: "*",
-      issueType: "完全重复行",
-      severity: "high",
-      affectedRows: fullDupCount,
-      affectedPercent: parseFloat(((fullDupCount / totalRows) * 100).toFixed(2)),
-      description: `发现 ${fullDupCount} 组完全重复的行`,
-      suggestion: "建议删除完全重复的行，保留一条",
-    });
-  }
-
-  // 探查结束后保持会话连接池，供后续 SQL 执行/校验复用；仅在 cleanupSession 时关闭
-  return {
-    sourceType: "mysql",
-    sourceName: `${config.database}.${safeTable}`,
-    totalRows,
-    totalCols: dbColumns.length,
-    schema,
-    sampleData: (sampleRows as Record<string, unknown>[]).slice(0, 10),
-    columnStats,
-    sampleSize: Math.min(100, totalRows),
-    issues,
-  };
 }
 
 // ---- File Parsing ----
@@ -545,9 +673,9 @@ export function cleanedFileName(originalFileName: string): string {
   return `${base}_cleaned${ext}`;
 }
 
-function readXlsxWorkbook(filePath: string): XLSX.WorkBook {
-  const buffer = readFileSync(filePath);
-  return XLSX.read(buffer, { type: "buffer" });
+export interface FileLoadOptions {
+  /** 最多加载的数据行数（不含表头逻辑由各类 loader 自行处理） */
+  maxRows?: number;
 }
 
 export interface FileLoadResult {
@@ -555,6 +683,9 @@ export interface FileLoadResult {
   columns: string[];
   jsonExport?: { mode: "array" } | { mode: "object"; key: string; wrapper: Record<string, unknown> };
   xmlExport?: { rootKey: string; containerKey?: string };
+  /** 是否因 maxRows 截断 */
+  truncated?: boolean;
+  estimatedTotalRows?: number;
 }
 
 export function getUploadPath(fileName: string): string {
@@ -631,44 +762,98 @@ export function detectFullyDuplicateRowsIssue(
   };
 }
 
-export async function parseCSVFile(filePath: string, previewRows: number = 100): Promise<ExplorationResult> {
-  const content = readFileSync(filePath, "utf-8");
+/** 快速统计文本文件行数（减 1 视为表头），用于大 CSV 总行数估算 */
+export function countTextFileLines(filePath: string): number {
+  const fd = openSync(filePath, "r");
+  const buffer = Buffer.alloc(64 * 1024);
+  let newlines = 0;
+  let offset = 0;
+  let bytesRead: number;
+  try {
+    while ((bytesRead = readSync(fd, buffer, 0, buffer.length, offset)) > 0) {
+      for (let i = 0; i < bytesRead; i++) {
+        if (buffer[i] === 10) newlines++;
+      }
+      offset += bytesRead;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return Math.max(0, newlines > 0 ? newlines - 1 : 0);
+}
 
-  const result = Papa.parse(content, {
-    header: true,
-    skipEmptyLines: true,
-    preview: previewRows,
-  });
+/** 基于文件类型估算总行数（大文件探查用，可能为近似值） */
+export function estimateFileRowCount(filePath: string, fileType: FileType): number {
+  switch (fileType) {
+    case "csv":
+    case "xml":
+      return countTextFileLines(filePath);
+    case "xlsx": {
+      const buffer = readFileSync(filePath);
+      const workbook = XLSX.read(buffer, { type: "buffer", bookSheets: true });
+      const sheetName = workbook.SheetNames[0];
+      const ref = workbook.Sheets[sheetName]?.["!ref"];
+      if (!ref) return 0;
+      const range = XLSX.utils.decode_range(ref);
+      return Math.max(0, range.e.r);
+    }
+    case "json": {
+      const content = readFileSync(filePath, "utf-8");
+      const data = JSON.parse(content) as unknown;
+      if (Array.isArray(data)) return data.length;
+      if (typeof data === "object" && data !== null) {
+        const arrKey = Object.keys(data as Record<string, unknown>).find((k) =>
+          Array.isArray((data as Record<string, unknown>)[k])
+        );
+        if (arrKey) return ((data as Record<string, unknown>)[arrKey] as unknown[]).length;
+        return 1;
+      }
+      return 0;
+    }
+    default:
+      return 0;
+  }
+}
 
-  const allResult = Papa.parse(content, { header: true, skipEmptyLines: true });
-  const totalRows = allResult.data.length;
-  const columns = result.meta.fields || [];
-
-  const schema: ColumnInfo[] = columns.map((col) => ({
-    name: col,
-    type: "VARCHAR",
-    nullable: true,
-  }));
-
+/** 在样本行上计算列统计（大文件探查） */
+function buildFileColumnStatsFromRows(
+  rows: Record<string, unknown>[],
+  columns: string[],
+  statsRowCount: number,
+  totalRows: number,
+  useSampleStats: boolean
+): { columnStats: ColumnStats[]; issues: DetectedIssue[] } {
   const columnStats: ColumnStats[] = [];
   const issues: DetectedIssue[] = [];
 
   for (const col of columns) {
-    const values = (allResult.data as Record<string, unknown>[]).map((row) => row[col]);
-    const nullCount = values.filter((v) => v === null || v === undefined || v === "").length;
-    const uniqueValues = new Set(values.filter((v) => v !== null && v !== undefined && v !== ""));
-    const nonNullValues = values.filter((v) => v !== null && v !== undefined && v !== "");
-
-    // Detect numeric
+    const values = rows.map((row) => row[col]);
+    const nullCountInSample = values.filter(
+      (v) => v === null || v === undefined || v === ""
+    ).length;
+    const uniqueValues = new Set(
+      values.filter((v) => v !== null && v !== undefined && v !== "")
+    );
+    const nonNullValues = values.filter(
+      (v) => v !== null && v !== undefined && v !== ""
+    );
     const numericCount = nonNullValues.filter((v) => !isNaN(Number(v))).length;
-    const detectedType = numericCount > nonNullValues.length * 0.8 ? "NUMERIC" : "VARCHAR";
+    const detectedType =
+      numericCount > nonNullValues.length * 0.8 ? "NUMERIC" : "VARCHAR";
 
-    const nullRate = totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0;
+    const nullRate =
+      statsRowCount > 0
+        ? Math.round((nullCountInSample / statsRowCount) * 10000) / 100
+        : 0;
+    const nullCount = useSampleStats
+      ? scaleNullCountFromSample(nullCountInSample, statsRowCount, totalRows)
+      : nullCountInSample;
 
     columnStats.push({
       columnName: col,
       dataType: detectedType,
       nullRate,
+      nullCount,
       uniqueCount: uniqueValues.size,
       sampleValues: nonNullValues.slice(0, 5).map((v) => String(v)),
     });
@@ -687,43 +872,92 @@ export async function parseCSVFile(filePath: string, previewRows: number = 100):
     }
   }
 
-  const dupIssue = detectFullyDuplicateRowsIssue(
-    allResult.data as Record<string, unknown>[],
-    columns,
-    totalRows
-  );
-  if (dupIssue) issues.push(dupIssue);
+  return { columnStats, issues };
+}
 
+function appendFileExploreMeta(
+  result: ExplorationResult,
+  useSampleStats: boolean,
+  rowCountApproximate: boolean
+): ExplorationResult {
   return {
-    sourceType: "csv",
-    sourceName: path.basename(filePath),
-    totalRows,
-    totalCols: columns.length,
-    schema,
-    sampleData: (result.data as Record<string, unknown>[]).slice(0, 10),
-    columnStats,
-    sampleSize: Math.min(previewRows, totalRows),
-    issues,
+    ...result,
+    sampleBasedStats: useSampleStats || undefined,
+    rowCountApproximate: rowCountApproximate || undefined,
   };
+}
+
+export async function parseCSVFile(filePath: string, previewRows: number = 100): Promise<ExplorationResult> {
+  const estimatedRows = countTextFileLines(filePath);
+  const useSampleStats = estimatedRows > FILE_EXPLORE_FULL_SCAN_ROW_LIMIT;
+  const totalRows = estimatedRows;
+  const statsLimit = Math.min(previewRows, EXPLORE_SAMPLE_LIMIT);
+  const rowCountApproximate = useSampleStats;
+
+  const loaded = useSampleStats
+    ? await loadCSVRowsAsync(filePath, { maxRows: statsLimit })
+    : loadCSVRows(filePath);
+  const columns = loaded.columns;
+  const statsRows = loaded.rows;
+  const statsRowCount = useSampleStats ? statsRows.length : totalRows;
+
+  const schema: ColumnInfo[] = columns.map((col) => ({
+    name: col,
+    type: "VARCHAR",
+    nullable: true,
+  }));
+
+  const { columnStats, issues } = buildFileColumnStatsFromRows(
+    statsRows,
+    columns,
+    statsRowCount,
+    totalRows,
+    useSampleStats
+  );
+
+  if (!useSampleStats) {
+    const dupIssue = detectFullyDuplicateRowsIssue(statsRows, columns, totalRows);
+    if (dupIssue) issues.push(dupIssue);
+  }
+
+  return appendFileExploreMeta(
+    {
+      sourceType: "csv",
+      sourceName: path.basename(filePath),
+      totalRows,
+      totalCols: columns.length,
+      schema,
+      sampleData: statsRows.slice(0, 10),
+      columnStats,
+      sampleSize: Math.min(statsLimit, totalRows),
+      issues,
+    },
+    useSampleStats,
+    rowCountApproximate
+  );
 }
 
 export async function parseJSONFile(filePath: string, previewRows: number = 100): Promise<ExplorationResult> {
   const content = readFileSync(filePath, "utf-8");
-  const data = JSON.parse(content);
+  const data = JSON.parse(content) as unknown;
 
   let rows: Record<string, unknown>[] = [];
   if (Array.isArray(data)) {
     rows = data;
   } else if (typeof data === "object" && data !== null) {
-    // Try to find array property
-    const arrKey = Object.keys(data).find((k) => Array.isArray(data[k]));
-    if (arrKey) rows = data[arrKey] as Record<string, unknown>[];
-    else rows = [data];
+    const arrKey = Object.keys(data).find((k) => Array.isArray((data as Record<string, unknown>)[k]));
+    if (arrKey) rows = (data as Record<string, unknown>)[arrKey] as Record<string, unknown>[];
+    else rows = [data as Record<string, unknown>];
   }
 
   const totalRows = rows.length;
+  const useSampleStats = totalRows > FILE_EXPLORE_FULL_SCAN_ROW_LIMIT;
+  const statsLimit = Math.min(previewRows, EXPLORE_SAMPLE_LIMIT);
+  const statsRows = useSampleStats ? rows.slice(0, statsLimit) : rows;
+  const statsRowCount = statsRows.length;
+
   const allKeys = new Set<string>();
-  rows.forEach((row) => Object.keys(row).forEach((k) => allKeys.add(k)));
+  statsRows.forEach((row) => Object.keys(row).forEach((k) => allKeys.add(k)));
   const columns = Array.from(allKeys);
 
   const schema: ColumnInfo[] = columns.map((col) => ({
@@ -732,54 +966,50 @@ export async function parseJSONFile(filePath: string, previewRows: number = 100)
     nullable: true,
   }));
 
-  const columnStats: ColumnStats[] = columns.map((col) => {
-    const values = rows.map((row) => row[col]);
-    const nullCount = values.filter((v) => v === null || v === undefined).length;
-    const uniqueValues = new Set(values.filter((v) => v !== null && v !== undefined));
-
-    return {
-      columnName: col,
-      dataType: "VARCHAR",
-      nullRate: totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0,
-      uniqueCount: uniqueValues.size,
-      sampleValues: values.filter((v) => v !== null && v !== undefined).slice(0, 5).map((v) =>
-        typeof v === "object" ? JSON.stringify(v) : String(v)
-      ),
-    };
-  });
-
-  const issues: DetectedIssue[] = columnStats
-    .filter((cs) => cs.nullRate > 5)
-    .map((cs) => ({
-      id: `issue_null_${cs.columnName}`,
-      column: cs.columnName,
-      issueType: "空值过多",
-      severity: cs.nullRate > 30 ? "high" : "medium",
-      affectedRows: Math.round((cs.nullRate / 100) * totalRows),
-      affectedPercent: cs.nullRate,
-      description: `列 "${cs.columnName}" 空值率为 ${cs.nullRate}%`,
-      suggestion: "建议使用合适的值填充空值",
-    }));
-
-  const dupIssue = detectFullyDuplicateRowsIssue(rows, columns, totalRows);
-  if (dupIssue) issues.push(dupIssue);
-
-  return {
-    sourceType: "json",
-    sourceName: path.basename(filePath),
+  const { columnStats, issues } = buildFileColumnStatsFromRows(
+    statsRows,
+    columns,
+    statsRowCount,
     totalRows,
-    totalCols: columns.length,
-    schema,
-    sampleData: rows.slice(0, 10),
-    columnStats,
-    sampleSize: Math.min(previewRows, totalRows),
-    issues,
-  };
+    useSampleStats
+  );
+
+  if (!useSampleStats) {
+    const dupIssue = detectFullyDuplicateRowsIssue(rows, columns, totalRows);
+    if (dupIssue) issues.push(dupIssue);
+  }
+
+  return appendFileExploreMeta(
+    {
+      sourceType: "json",
+      sourceName: path.basename(filePath),
+      totalRows,
+      totalCols: columns.length,
+      schema,
+      sampleData: statsRows.slice(0, 10),
+      columnStats,
+      sampleSize: Math.min(statsLimit, totalRows),
+      issues,
+    },
+    useSampleStats,
+    false
+  );
 }
 
 export async function parseXLSXFile(filePath: string, previewRows: number = 100): Promise<ExplorationResult> {
-  const workbook = readXlsxWorkbook(filePath);
-  const sheetName = workbook.SheetNames[0];
+  const buffer = readFileSync(filePath);
+  const metaWorkbook = XLSX.read(buffer, { type: "buffer", bookSheets: true });
+  const sheetName = metaWorkbook.SheetNames[0];
+  const sheetRef = metaWorkbook.Sheets[sheetName]?.["!ref"];
+  const totalRows = sheetRef ? Math.max(0, XLSX.utils.decode_range(sheetRef).e.r) : 0;
+  const useSampleStats = totalRows > FILE_EXPLORE_FULL_SCAN_ROW_LIMIT;
+  const statsLimit = Math.min(previewRows, EXPLORE_SAMPLE_LIMIT);
+  const readRowCap = useSampleStats ? statsLimit + 1 : undefined;
+
+  const workbook = XLSX.read(buffer, {
+    type: "buffer",
+    sheetRows: readRowCap,
+  });
   const worksheet = workbook.Sheets[sheetName];
   const rows = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as unknown[][];
 
@@ -789,7 +1019,7 @@ export async function parseXLSXFile(filePath: string, previewRows: number = 100)
 
   const headers = (rows[0] as string[]).map((h) => String(h).trim());
   const dataRows = rows.slice(1);
-  const totalRows = dataRows.length;
+  const statsRowCount = dataRows.length;
 
   const schema: ColumnInfo[] = headers.map((col) => ({
     name: col,
@@ -797,63 +1027,42 @@ export async function parseXLSXFile(filePath: string, previewRows: number = 100)
     nullable: true,
   }));
 
-  const columnStats: ColumnStats[] = [];
-  const issues: DetectedIssue[] = [];
-
-  for (let i = 0; i < headers.length; i++) {
-    const col = headers[i];
-    const values = dataRows.map((row) => row[i]);
-    const nullCount = values.filter((v) => v === null || v === undefined || v === "").length;
-    const uniqueValues = new Set(values.filter((v) => v !== null && v !== undefined && v !== ""));
-
-    const nullRate = totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0;
-
-    columnStats.push({
-      columnName: col,
-      dataType: "VARCHAR",
-      nullRate,
-      uniqueCount: uniqueValues.size,
-      sampleValues: values.filter((v) => v !== null && v !== undefined).slice(0, 5).map((v) => String(v)),
-    });
-
-    if (nullRate > 5) {
-      issues.push({
-        id: `issue_null_${col}`,
-        column: col,
-        issueType: "空值过多",
-        severity: nullRate > 30 ? "high" : "medium",
-        affectedRows: nullCount,
-        affectedPercent: parseFloat(nullRate.toFixed(2)),
-        description: `列 "${col}" 空值率为 ${nullRate}%`,
-        suggestion: "建议使用合适的值填充空值",
-      });
-    }
-  }
-
-  // Convert to record format for sample data
   const allRecords = dataRows.map((row) => {
     const record: Record<string, unknown> = {};
     headers.forEach((h, i) => {
-      record[h] = row[i];
+      record[h] = (row as unknown[])[i];
     });
     return record;
   });
-  const sampleData = allRecords.slice(0, 10);
 
-  const dupIssue = detectFullyDuplicateRowsIssue(allRecords, headers, totalRows);
-  if (dupIssue) issues.push(dupIssue);
-
-  return {
-    sourceType: "xlsx",
-    sourceName: path.basename(filePath),
+  const { columnStats, issues } = buildFileColumnStatsFromRows(
+    allRecords,
+    headers,
+    statsRowCount,
     totalRows,
-    totalCols: headers.length,
-    schema,
-    sampleData,
-    columnStats,
-    sampleSize: Math.min(previewRows, totalRows),
-    issues,
-  };
+    useSampleStats
+  );
+
+  if (!useSampleStats) {
+    const dupIssue = detectFullyDuplicateRowsIssue(allRecords, headers, totalRows);
+    if (dupIssue) issues.push(dupIssue);
+  }
+
+  return appendFileExploreMeta(
+    {
+      sourceType: "xlsx",
+      sourceName: path.basename(filePath),
+      totalRows,
+      totalCols: headers.length,
+      schema,
+      sampleData: allRecords.slice(0, 10),
+      columnStats,
+      sampleSize: Math.min(statsLimit, totalRows),
+      issues,
+    },
+    useSampleStats,
+    useSampleStats
+  );
 }
 
 export async function parseXMLFile(filePath: string, previewRows: number = 100): Promise<ExplorationResult> {
@@ -961,29 +1170,124 @@ export async function exploreFile(
   }
 }
 
-function loadCSVRows(filePath: string): FileLoadResult {
-  const content = readFileSync(filePath, "utf-8");
-  const parsed = Papa.parse<Record<string, unknown>>(content, { header: true, skipEmptyLines: true });
-  const rows = parsed.data;
-  const columns = parsed.meta.fields || (rows[0] ? Object.keys(rows[0]) : []);
-  return { rows, columns };
+/** 流式读取 CSV 前 N 行（大文件避免整文件载入内存） */
+async function loadCSVRowsStreaming(
+  filePath: string,
+  maxRows: number
+): Promise<{ rows: Record<string, unknown>[]; columns: string[] }> {
+  const stream = createReadStream(filePath, { encoding: "utf-8" });
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+  let headers: string[] = [];
+  const rows: Record<string, unknown>[] = [];
+  let lineIndex = 0;
+
+  return new Promise((resolve, reject) => {
+    rl.on("line", (line) => {
+      if (lineIndex === 0) {
+        const headerParsed = Papa.parse<string[]>(line, { header: false });
+        headers = (headerParsed.data[0] ?? []).map((h) => String(h).trim());
+        lineIndex++;
+        return;
+      }
+
+      if (rows.length >= maxRows) return;
+
+      const fieldParsed = Papa.parse<string[]>(line, { header: false });
+      const fields = fieldParsed.data[0] ?? [];
+      const row: Record<string, unknown> = {};
+      headers.forEach((header, idx) => {
+        row[header] = fields[idx] ?? null;
+      });
+      if (Object.keys(row).length > 0) {
+        rows.push(row);
+      }
+      lineIndex++;
+    });
+
+    rl.on("close", () => resolve({ rows, columns: headers }));
+    rl.on("error", reject);
+    stream.on("error", reject);
+  });
 }
 
-function loadJSONRows(filePath: string): FileLoadResult {
+async function loadCSVRowsAsync(filePath: string, options?: FileLoadOptions): Promise<FileLoadResult> {
+  const estimatedTotalRows = countTextFileLines(filePath);
+  const maxRows = options?.maxRows;
+
+  if (maxRows != null) {
+    const { rows, columns } = await loadCSVRowsStreaming(filePath, maxRows);
+    return {
+      rows,
+      columns,
+      truncated: estimatedTotalRows > rows.length,
+      estimatedTotalRows,
+    };
+  }
+
+  const content = readFileSync(filePath, "utf-8");
+  const parsed = Papa.parse<Record<string, unknown>>(content, {
+    header: true,
+    skipEmptyLines: true,
+  });
+  const rows = parsed.data;
+  const columns = parsed.meta.fields || (rows[0] ? Object.keys(rows[0]) : []);
+  return {
+    rows,
+    columns,
+    truncated: false,
+    estimatedTotalRows,
+  };
+}
+
+function loadCSVRows(filePath: string, options?: FileLoadOptions): FileLoadResult {
+  const estimatedTotalRows = countTextFileLines(filePath);
+  const maxRows = options?.maxRows;
+
+  if (maxRows != null && estimatedTotalRows > maxRows) {
+    throw new Error("大 CSV 请使用 loadCSVRowsAsync 流式读取");
+  }
+
+  const content = readFileSync(filePath, "utf-8");
+  const parsed = Papa.parse<Record<string, unknown>>(content, {
+    header: true,
+    skipEmptyLines: true,
+    preview: maxRows,
+  });
+  const rows = parsed.data;
+  const columns = parsed.meta.fields || (rows[0] ? Object.keys(rows[0]) : []);
+  return {
+    rows,
+    columns,
+    truncated: maxRows != null && estimatedTotalRows > rows.length,
+    estimatedTotalRows,
+  };
+}
+
+function loadJSONRows(filePath: string, options?: FileLoadOptions): FileLoadResult {
   const content = readFileSync(filePath, "utf-8");
   const data = JSON.parse(content) as unknown;
+  const maxRows = options?.maxRows;
 
   if (Array.isArray(data)) {
-    const rows = data as Record<string, unknown>[];
+    const fullRows = data as Record<string, unknown>[];
+    const rows = maxRows != null ? fullRows.slice(0, maxRows) : fullRows;
     const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
-    return { rows, columns, jsonExport: { mode: "array" } };
+    return {
+      rows,
+      columns,
+      jsonExport: { mode: "array" },
+      truncated: maxRows != null && fullRows.length > rows.length,
+      estimatedTotalRows: fullRows.length,
+    };
   }
 
   if (typeof data === "object" && data !== null) {
     const record = data as Record<string, unknown>;
     const arrKey = Object.keys(record).find((k) => Array.isArray(record[k]));
     if (arrKey) {
-      const rows = record[arrKey] as Record<string, unknown>[];
+      const fullRows = record[arrKey] as Record<string, unknown>[];
+      const rows = maxRows != null ? fullRows.slice(0, maxRows) : fullRows;
       const columns = rows.length > 0 ? Object.keys(rows[0]) : [];
       const wrapper = { ...record };
       delete wrapper[arrKey];
@@ -991,6 +1295,8 @@ function loadJSONRows(filePath: string): FileLoadResult {
         rows,
         columns,
         jsonExport: { mode: "object", key: arrKey, wrapper },
+        truncated: maxRows != null && fullRows.length > rows.length,
+        estimatedTotalRows: fullRows.length,
       };
     }
     return { rows: [record], columns: Object.keys(record), jsonExport: { mode: "array" } };
@@ -999,13 +1305,20 @@ function loadJSONRows(filePath: string): FileLoadResult {
   return { rows: [], columns: [] };
 }
 
-function loadXlsxRows(filePath: string): FileLoadResult {
-  const workbook = readXlsxWorkbook(filePath);
-  const sheetName = workbook.SheetNames[0];
+function loadXlsxRows(filePath: string, options?: FileLoadOptions): FileLoadResult {
+  const buffer = readFileSync(filePath);
+  const metaWorkbook = XLSX.read(buffer, { type: "buffer", bookSheets: true });
+  const sheetName = metaWorkbook.SheetNames[0];
+  const sheetRef = metaWorkbook.Sheets[sheetName]?.["!ref"];
+  const estimatedTotalRows = sheetRef ? Math.max(0, XLSX.utils.decode_range(sheetRef).e.r) : 0;
+  const maxRows = options?.maxRows;
+  const readCap = maxRows != null ? maxRows + 1 : undefined;
+
+  const workbook = XLSX.read(buffer, { type: "buffer", sheetRows: readCap });
   const worksheet = workbook.Sheets[sheetName];
   const matrix = XLSX.utils.sheet_to_json(worksheet, { header: 1 }) as unknown[][];
   if (matrix.length === 0) {
-    return { rows: [], columns: [] };
+    return { rows: [], columns: [], estimatedTotalRows };
   }
   const headers = (matrix[0] as string[]).map((h) => String(h).trim());
   const rows = matrix.slice(1).map((row) => {
@@ -1015,7 +1328,12 @@ function loadXlsxRows(filePath: string): FileLoadResult {
     });
     return record;
   });
-  return { rows, columns: headers };
+  return {
+    rows,
+    columns: headers,
+    truncated: maxRows != null && estimatedTotalRows > rows.length,
+    estimatedTotalRows,
+  };
 }
 
 async function loadXMLRows(filePath: string): Promise<FileLoadResult> {
@@ -1045,14 +1363,20 @@ async function loadXMLRows(filePath: string): Promise<FileLoadResult> {
   return { rows: [parsedRecord], columns: Object.keys(parsedRecord), xmlExport: { rootKey: rootKeys[0] || "root" } };
 }
 
-export async function loadFullFileData(filePath: string, fileType: FileType): Promise<FileLoadResult> {
+export async function loadFullFileData(
+  filePath: string,
+  fileType: FileType,
+  options?: FileLoadOptions
+): Promise<FileLoadResult> {
   switch (fileType) {
     case "csv":
-      return loadCSVRows(filePath);
+      return options?.maxRows != null
+        ? loadCSVRowsAsync(filePath, options)
+        : loadCSVRows(filePath, options);
     case "json":
-      return loadJSONRows(filePath);
+      return loadJSONRows(filePath, options);
     case "xlsx":
-      return loadXlsxRows(filePath);
+      return loadXlsxRows(filePath, options);
     case "xml":
       return loadXMLRows(filePath);
     default:
