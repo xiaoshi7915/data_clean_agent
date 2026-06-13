@@ -286,10 +286,14 @@ async function explorePostgresTable(
 
       if (
         isIdLikeColumn(stat.columnName) &&
-        stat.uniqueCount < totalRows &&
+        stat.uniqueCount < (useSampleStats ? statsRowCount : totalRows) &&
         stat.nullCount === 0
       ) {
-        const dupCount = totalRows - stat.uniqueCount;
+        const compareRows = useSampleStats ? statsRowCount : totalRows;
+        const dupCountInBasis = compareRows - stat.uniqueCount;
+        const dupCount = useSampleStats
+          ? scaleNullCountFromSample(dupCountInBasis, statsRowCount, totalRows)
+          : dupCountInBasis;
         issues.push({
           id: `issue_dup_${stat.columnName}`,
           column: stat.columnName,
