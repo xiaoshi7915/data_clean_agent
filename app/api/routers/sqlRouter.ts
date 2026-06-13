@@ -79,7 +79,7 @@ export const sqlRouter = createRouter({
           return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
         await validatePhaseTransition(input.sessionId, "generate", input.runIndex);
-        const runIndex = input.runIndex ?? (await getCurrentRunIndex(input.sessionId));
+        const runIndex = await getCurrentRunIndex(input.sessionId);
         const dbRules = await loadRulesForSessionRun(input.sessionId, runIndex);
         const rulesSource =
           dbRules.length > 0

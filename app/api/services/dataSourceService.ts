@@ -596,10 +596,14 @@ export async function exploreDatabase(
 
       if (
         isIdLikeColumn(colName) &&
-        stat.uniqueCount < totalRows &&
+        stat.uniqueCount < (useSampleStats ? statsRowCount : totalRows) &&
         stat.nullCount === 0
       ) {
-        const dupCount = totalRows - stat.uniqueCount;
+        const compareRows = useSampleStats ? statsRowCount : totalRows;
+        const dupCountInBasis = compareRows - stat.uniqueCount;
+        const dupCount = useSampleStats
+          ? scaleNullCountFromSample(dupCountInBasis, statsRowCount, totalRows)
+          : dupCountInBasis;
         issues.push({
           id: `issue_dup_${colName}`,
           column: colName,
