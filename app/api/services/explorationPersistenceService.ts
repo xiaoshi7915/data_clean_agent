@@ -6,7 +6,7 @@ import {
   updateSessionTargetTable,
   updateSessionTitle,
 } from "./sessionService";
-import { getCurrentRunIndex } from "./pipelineRunService";
+import { getCurrentRunIndex, HistoricalRunWriteError } from "./pipelineRunService";
 import type {
   CleaningAction,
   CleaningRule,
@@ -25,6 +25,8 @@ export interface PersistExplorationOptions {
   lastAction?: "db_explored" | "file_explored";
   /** 探查完成后更新会话标题 */
   sessionTitle?: string;
+  /** 探查开始时固定的 runIndex，防止长耗时探查期间流水线切换导致写入错误版本 */
+  runIndex?: number;
 }
 
 /**
@@ -37,7 +39,15 @@ export async function persistExploration(
   options: PersistExplorationOptions = {}
 ): Promise<void> {
   const db = getDb();
-  const runIndex = await getCurrentRunIndex(sessionId);
+  if (options.runIndex != null) {
+    const current = await getCurrentRunIndex(sessionId);
+    if (current !== options.runIndex) {
+      throw new HistoricalRunWriteError(
+        `探查期间流水线已切换到第 ${current} 次运行，本次探查结果已丢弃。请重新探查。`
+      );
+    }
+  }
+  const runIndex = options.runIndex ?? (await getCurrentRunIndex(sessionId));
 
   // 同一 run 内重新探查时替换旧结果
   await db

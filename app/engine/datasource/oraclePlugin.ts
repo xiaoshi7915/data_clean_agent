@@ -257,7 +257,8 @@ async function exploreOracleTable(
           stat.dataType,
           totalRows,
           stat.nullCount ?? 0,
-          stat.uniqueCount
+          stat.uniqueCount,
+          useSampleStats ? { statsRowCount } : undefined
         )
       );
 

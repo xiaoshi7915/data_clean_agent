@@ -1,4 +1,10 @@
 import type { ColumnInfo, ColumnStats, DetectedIssue } from "@contracts/types";
+import { scaleNullCountFromSample } from "./dbExploreSampling";
+
+export interface BuildColumnIssuesOptions {
+  /** 样本统计时的有效行数；小于 totalRows 时表示大表样本探查 */
+  statsRowCount?: number;
+}
 
 /** 校验表名，防止 SQL 注入 */
 export function sanitizeTableName(name: string): string {
@@ -32,7 +38,8 @@ export function buildColumnIssues(
   _dataType: string,
   totalRows: number,
   nullCount: number,
-  uniqueCount: number
+  uniqueCount: number,
+  options?: BuildColumnIssuesOptions
 ): DetectedIssue[] {
   const issues: DetectedIssue[] = [];
   const nullRate = totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0;
@@ -50,8 +57,16 @@ export function buildColumnIssues(
     });
   }
 
-  if (isIdLikeColumn(columnName) && uniqueCount < totalRows && nullCount === 0) {
-    const dupCount = totalRows - uniqueCount;
+  const statsRowCount = options?.statsRowCount;
+  const useSampleBasis =
+    statsRowCount != null && statsRowCount > 0 && statsRowCount < totalRows;
+  const compareRows = useSampleBasis ? statsRowCount : totalRows;
+
+  if (isIdLikeColumn(columnName) && uniqueCount < compareRows && nullCount === 0) {
+    const dupCountInBasis = compareRows - uniqueCount;
+    const dupCount = useSampleBasis
+      ? scaleNullCountFromSample(dupCountInBasis, statsRowCount, totalRows)
+      : dupCountInBasis;
     issues.push({
       id: `issue_dup_${columnName}`,
       column: columnName,

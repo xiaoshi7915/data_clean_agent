@@ -6,6 +6,10 @@ vi.mock("./sessionService", () => ({
   getFullSession: vi.fn(),
 }));
 
+vi.mock("./pipelineRunService", () => ({
+  assertWritableRun: vi.fn().mockResolvedValue(1),
+}));
+
 import { getFullSession } from "./sessionService";
 
 const mockedGetFullSession = vi.mocked(getFullSession);
