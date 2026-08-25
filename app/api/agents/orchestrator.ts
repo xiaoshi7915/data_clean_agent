@@ -15,6 +15,7 @@ import {
   persistAnalysis,
   loadLatestExploration,
 } from "../services/explorationPersistenceService";
+import { getCurrentRunIndex } from "../services/pipelineRunService";
 import { runSchemaAgent } from "./schemaAgent";
 import { runQualityAgent } from "./qualityAgent";
 import { runRepairAgent } from "./repairAgent";
@@ -193,6 +194,7 @@ async function invokeAgentHandler(
         return { ...ctx, state: "failed", errors: [...ctx.errors, "未连接数据源"] };
       }
       const isFile = !!session.dataSource.fileConfig;
+      const runIndex = await getCurrentRunIndex(ctx.input.sessionId);
       const result = await runSchemaAgent({
         sessionId: ctx.input.sessionId,
         dataSource: session.dataSource,
@@ -204,6 +206,7 @@ async function invokeAgentHandler(
       }
 
       await persistExploration(ctx.input.sessionId, result.data.exploration, {
+        runIndex,
         tableName: isFile ? undefined : tableName,
         lastAction: isFile ? "file_explored" : "db_explored",
         sessionTitle: `${tableName} · 探查完成`,
