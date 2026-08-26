@@ -206,7 +206,10 @@ async function exploreSqlServerTable(
         )
       );
       issues.push(
-        ...buildColumnIssues(columnName, String(col.data_type), totalRows, nullCount, uniqueCount)
+        ...buildColumnIssues(columnName, String(col.data_type), totalRows, nullCount, uniqueCount, {
+          useSampleStats,
+          statsRowCount,
+        })
       );
     }
 
