@@ -595,6 +595,7 @@ export async function exploreDatabase(
       }
 
       if (
+        !useSampleStats &&
         isIdLikeColumn(colName) &&
         stat.uniqueCount < totalRows &&
         stat.nullCount === 0
