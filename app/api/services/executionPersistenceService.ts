@@ -7,6 +7,8 @@ import type { ExecutionResult } from "@contracts/types";
 export interface PersistExecutionOptions {
   /** dry-run 也写入日志，便于对比历史 */
   dryRun?: boolean;
+  /** 写入时锁定的 runIndex */
+  runIndex?: number;
 }
 
 /**
@@ -19,7 +21,7 @@ export async function persistExecution(
   _options: PersistExecutionOptions = {}
 ): Promise<void> {
   const db = getDb();
-  const runIndex = await getCurrentRunIndex(sessionId);
+  const runIndex = _options.runIndex ?? (await getCurrentRunIndex(sessionId));
 
   // 同一 run 内再次执行时保留多条记录；加载时取最新一条
   await db.insert(executionLogs).values({

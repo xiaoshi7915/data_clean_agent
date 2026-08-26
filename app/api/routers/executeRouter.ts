@@ -72,7 +72,7 @@ export const executeRouter = createRouter({
         if (!isSqlDialectSupported(input.dialect)) {
           return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
-        await validatePhaseTransition(input.sessionId, "execute", input.runIndex);
+        const { runIndex } = await validatePhaseTransition(input.sessionId, "execute", input.runIndex);
         const resolvedDbConfig = await resolveDbConfigInput(input.sessionId, input.dbConfig);
         const result = await executeSQLSteps(
           input.sessionId,
@@ -93,7 +93,7 @@ export const executeRouter = createRouter({
           }
         }
 
-        await persistExecution(input.sessionId, result, { dryRun: input.dryRun });
+        await persistExecution(input.sessionId, result, { dryRun: input.dryRun, runIndex });
 
         if (
           result.overallStatus === "success" &&
@@ -152,7 +152,7 @@ export const executeRouter = createRouter({
             result: null,
           };
         }
-        await validatePhaseTransition(input.sessionId, "execute", input.runIndex);
+        const { runIndex } = await validatePhaseTransition(input.sessionId, "execute", input.runIndex);
         const resolvedFilePath = resolveExistingUploadPath(input.filePath);
         const result = await executeFileCleaning(
           resolvedFilePath,
@@ -163,7 +163,7 @@ export const executeRouter = createRouter({
           input.dryRun
         );
 
-        await persistExecution(input.sessionId, result, { dryRun: input.dryRun });
+        await persistExecution(input.sessionId, result, { dryRun: input.dryRun, runIndex });
 
         if (
           result.overallStatus === "success" &&
