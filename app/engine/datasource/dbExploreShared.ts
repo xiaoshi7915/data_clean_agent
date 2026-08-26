@@ -32,10 +32,14 @@ export function buildColumnIssues(
   _dataType: string,
   totalRows: number,
   nullCount: number,
-  uniqueCount: number
+  uniqueCount: number,
+  options?: { useSampleStats?: boolean; statsRowCount?: number }
 ): DetectedIssue[] {
   const issues: DetectedIssue[] = [];
-  const nullRate = totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0;
+  const useSampleStats = options?.useSampleStats === true;
+  const statsRowCount = options?.statsRowCount ?? totalRows;
+  const nullRate =
+    statsRowCount > 0 ? Math.round((nullCount / statsRowCount) * 10000) / 100 : 0;
 
   if (nullRate > 5) {
     issues.push({
@@ -50,7 +54,13 @@ export function buildColumnIssues(
     });
   }
 
-  if (isIdLikeColumn(columnName) && uniqueCount < totalRows && nullCount === 0) {
+  // 样本统计下 uniqueCount 仅反映样本，不能与全表行数比较，否则会误报唯一键重复
+  if (
+    !useSampleStats &&
+    isIdLikeColumn(columnName) &&
+    uniqueCount < totalRows &&
+    nullCount === 0
+  ) {
     const dupCount = totalRows - uniqueCount;
     issues.push({
       id: `issue_dup_${columnName}`,
