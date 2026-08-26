@@ -26,7 +26,7 @@ export const analyzeRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await validatePhaseTransition(input.sessionId, "analyze", input.runIndex);
+        const { runIndex } = await validatePhaseTransition(input.sessionId, "analyze", input.runIndex);
         const exploration = input.explorationResult as ExplorationResult;
         const agentResult = runQualityAgent({ sessionId: input.sessionId, exploration });
         if (!agentResult.success || !agentResult.data) {
@@ -39,7 +39,7 @@ export const analyzeRouter = createRouter({
         }
         const { report, rules } = agentResult.data;
 
-        await persistAnalysis(input.sessionId, report, rules, { phase: "before" });
+        await persistAnalysis(input.sessionId, report, rules, { phase: "before", runIndex });
 
         return { success: true, report, rules };
       } catch (error) {
