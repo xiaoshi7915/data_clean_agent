@@ -22,7 +22,7 @@ export async function validatePhaseTransition(
   targetAction: PhaseAction,
   clientRunIndex?: number
 ) {
-  await assertWritableRun(sessionId, clientRunIndex);
+  const runIndex = await assertWritableRun(sessionId, clientRunIndex);
   const session = await getFullSession(sessionId);
   if (!session) {
     throw new PhaseValidationError("会话不存在，请重新创建对话");
@@ -81,7 +81,7 @@ export async function validatePhaseTransition(
     }
   }
 
-  return session;
+  return { session, runIndex };
 }
 
 export function phaseForAction(action: PhaseAction): CleaningPhase {
