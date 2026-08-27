@@ -54,7 +54,11 @@ export async function persistAfterQualityReport(
   sessionId: string,
   metricsBefore: QualityScore,
   metricsAfter: QualityScore,
-  options?: { highPriorityIssues?: QualityReport["highPriorityIssues"] }
+  options?: {
+    highPriorityIssues?: QualityReport["highPriorityIssues"];
+    /** 写入时锁定的 runIndex（与执行阶段校验一致） */
+    runIndex?: number;
+  }
 ): Promise<QualityMetricsDiff> {
   const diff = computeQualityDiff(metricsBefore, metricsAfter);
   const summary = `清洗后质量对比：${formatQualityDiffSummary(diff)}`;
@@ -71,6 +75,7 @@ export async function persistAfterQualityReport(
   await persistAnalysis(sessionId, report, [], {
     phase: "after" as QualityReportPhase,
     replaceRules: false,
+    runIndex: options?.runIndex,
   });
 
   return diff;
