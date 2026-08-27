@@ -103,7 +103,8 @@ export const executeRouter = createRouter({
           await persistAfterQualityReport(
             input.sessionId,
             input.metricsBefore,
-            result.metricsAfter
+            result.metricsAfter,
+            { runIndex }
           );
         }
 
@@ -173,7 +174,8 @@ export const executeRouter = createRouter({
           await persistAfterQualityReport(
             input.sessionId,
             input.metricsBefore,
-            result.metricsAfter
+            result.metricsAfter,
+            { runIndex }
           );
         }
 
