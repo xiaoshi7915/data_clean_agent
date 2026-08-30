@@ -133,7 +133,7 @@ async function explorePostgresTable(
   const safeTable = sanitizeTableName(tableName);
   const safeLimit = sanitizeLimit(limit);
   const schema = config.schema || "public";
-  const quotedTable = postgresDialect.quoteTable(safeTable);
+  const quotedTable = `${postgresDialect.quoteIdentifier(schema)}.${postgresDialect.quoteTable(safeTable)}`;
   const report = options?.onProgress;
 
   return withClient(config, async (client) => {
@@ -160,7 +160,7 @@ async function explorePostgresTable(
 
     const metricCollector = new ExplorationMetricCollector(
       postgresDialect,
-      safeTable,
+      `${schema}.${safeTable}`,
       (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
     );
 
@@ -285,6 +285,7 @@ async function explorePostgresTable(
       }
 
       if (
+        !useSampleStats &&
         isIdLikeColumn(stat.columnName) &&
         stat.uniqueCount < totalRows &&
         stat.nullCount === 0

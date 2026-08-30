@@ -25,6 +25,8 @@ export interface PersistExplorationOptions {
   lastAction?: "db_explored" | "file_explored";
   /** 探查完成后更新会话标题 */
   sessionTitle?: string;
+  /** 写入时锁定的 runIndex（避免长探查期间 pipeline 重置导致写错 run） */
+  runIndex?: number;
 }
 
 /**
@@ -37,7 +39,7 @@ export async function persistExploration(
   options: PersistExplorationOptions = {}
 ): Promise<void> {
   const db = getDb();
-  const runIndex = await getCurrentRunIndex(sessionId);
+  const runIndex = options.runIndex ?? (await getCurrentRunIndex(sessionId));
 
   // 同一 run 内重新探查时替换旧结果
   await db
@@ -80,6 +82,8 @@ export interface PersistAnalysisOptions {
   phase?: QualityReportPhase;
   /** 重新分析时是否替换已有规则（默认 true） */
   replaceRules?: boolean;
+  /** 写入时锁定的 runIndex */
+  runIndex?: number;
 }
 
 /**
@@ -96,7 +100,7 @@ export async function persistAnalysis(
   const replaceRules = options.replaceRules !== false;
 
   const db = getDb();
-  const runIndex = await getCurrentRunIndex(sessionId);
+  const runIndex = options.runIndex ?? (await getCurrentRunIndex(sessionId));
 
   await db.insert(qualityReports).values({
     sessionId,
