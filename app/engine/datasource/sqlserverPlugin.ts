@@ -114,9 +114,10 @@ async function exploreSqlServerTable(
          ORDER BY ordinal_position`
       );
 
+    const metricTableName = `${schema}.${safeTable}`;
     const metricCollector = new ExplorationMetricCollector(
       sqlserverDialect,
-      safeTable,
+      metricTableName,
       (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
     );
 
