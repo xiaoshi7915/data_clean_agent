@@ -144,9 +144,10 @@ async function exploreOracleTable(
         { owner, tableName: safeTable }
       );
 
+      const metricTableName = `${owner}.${safeTable}`;
       const metricCollector = new ExplorationMetricCollector(
         oracleDialect,
-        safeTable,
+        metricTableName,
         (metricId, column) => metricRegistry.resolve(metricId, { column, table: safeTable })
       );
 
