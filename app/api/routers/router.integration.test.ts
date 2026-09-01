@@ -38,6 +38,7 @@ vi.mock("../services/fileCleaningService", () => ({
 vi.mock("../queries/connection", () => ({
   getDb: () => ({
     insert: vi.fn().mockReturnValue({ values: vi.fn().mockResolvedValue(undefined) }),
+    delete: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
   }),
 }));
 
@@ -101,17 +102,20 @@ describe("appRouter integration", () => {
 
   it("analyze 在有效会话下成功", async () => {
     mockedValidate.mockResolvedValue({
-      sessionId: "sess_1",
-      currentPhase: "explore",
-      dataSource: { type: "mysql", name: "db" },
-      explorationResult: undefined,
-      cleaningRules: [],
-      confirmedRules: [],
-      messages: [],
-      lastAction: "",
-      retryCount: 0,
-      createdAt: "",
-      updatedAt: "",
+      session: {
+        sessionId: "sess_1",
+        currentPhase: "explore",
+        dataSource: { type: "mysql", name: "db" },
+        explorationResult: undefined,
+        cleaningRules: [],
+        confirmedRules: [],
+        messages: [],
+        lastAction: "",
+        retryCount: 0,
+        createdAt: "",
+        updatedAt: "",
+      },
+      runIndex: 1,
     } as never);
 
     const caller = createCaller();
@@ -202,7 +206,7 @@ describe("appRouter integration", () => {
 
   it("SCRIPT_ONLY 模式下拒绝非 dry-run 执行", async () => {
     vi.stubEnv("ALLOW_EXECUTE", "");
-    mockedValidate.mockResolvedValue({} as never);
+    mockedValidate.mockResolvedValue({ session: {} as never, runIndex: 1 } as never);
     mockedExecute.mockResolvedValue({ overallStatus: "success", stepResults: [] } as never);
 
     const caller = createCaller();
