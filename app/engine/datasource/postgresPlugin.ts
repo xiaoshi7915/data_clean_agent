@@ -22,10 +22,7 @@ import {
   shouldUseApproximateRowCount,
   shouldUseSampleStats,
 } from "./dbExploreSampling";
-import {
-  EXPLORE_COLUMN_STATS_CONCURRENCY,
-  mapWithConcurrency,
-} from "./exploreColumnStats";
+import { mapWithConcurrency } from "./exploreColumnStats";
 import {
   mapExploreQueryError,
   withExploreQueryTimeout,
@@ -215,7 +212,8 @@ async function explorePostgresTable(
     }));
 
     const columnTotal = columnsResult.length;
-    const concurrency = useSampleStats ? 1 : EXPLORE_COLUMN_STATS_CONCURRENCY;
+    // 单 client 连接不支持并发查询（node-pg 限制）
+    const concurrency = 1;
 
     const columnStats = await mapWithConcurrency(
       columnsResult,

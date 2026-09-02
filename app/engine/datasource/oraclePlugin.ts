@@ -26,10 +26,7 @@ import {
   shouldUseApproximateRowCount,
   shouldUseSampleStats,
 } from "./dbExploreSampling";
-import {
-  EXPLORE_COLUMN_STATS_CONCURRENCY,
-  mapWithConcurrency,
-} from "./exploreColumnStats";
+import { mapWithConcurrency } from "./exploreColumnStats";
 import {
   mapExploreQueryError,
   withExploreQueryTimeout,
@@ -198,7 +195,8 @@ async function exploreOracleTable(
       );
 
       const columnTotal = columnsRows.length;
-      const concurrency = useSampleStats ? 1 : EXPLORE_COLUMN_STATS_CONCURRENCY;
+      // 单 connection 不支持并发查询（oracledb 限制）
+      const concurrency = 1;
 
       const columnStats = await mapWithConcurrency(
         columnsRows,
