@@ -105,9 +105,7 @@ export async function runSqlSteps(options: SqlStepRunnerOptions): Promise<Execut
       });
 
       overallStatus = step.stepNumber === 0 ? "failed" : "partial";
-      if (step.stepNumber === 0) {
-        break;
-      }
+      break;
     }
   }
 

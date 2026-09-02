@@ -86,7 +86,31 @@ const connectionPools = new Map<string, SessionDbPool>();
 const connectionConfigKeys = new Map<string, string>();
 
 /** 同一会话并发建连时串行化，避免 A 关闭 B 正在使用的池导致 Pool is closed */
-const connectionLocks = new Map<string, Promise<SessionDbPool>>();
+const connectionLocks = new Map<string, Promise<void>>();
+
+/** 按会话串行化连接创建，并在持锁后校验配置是否仍匹配 */
+async function withSessionConnectionLock<T>(
+  sessionId: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const previous = connectionLocks.get(sessionId) ?? Promise.resolve();
+  let releaseLock!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  const chained = previous.then(() => current);
+  connectionLocks.set(sessionId, chained);
+
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    releaseLock();
+    if (connectionLocks.get(sessionId) === chained) {
+      connectionLocks.delete(sessionId);
+    }
+  }
+}
 
 function buildConfigKey(config: DBConnectionConfig, dialect: DatabaseDialect): string {
   return `${dialect}|${config.host}|${config.port}|${config.database}|${config.username}|${config.password}`;
@@ -228,32 +252,21 @@ export async function createConnectionForDialect(
   config: DBConnectionConfig,
   dialect: DatabaseDialect = "mysql"
 ): Promise<SessionDbPool> {
-  const configKey = buildConfigKey(config, dialect);
-  const existing = connectionPools.get(sessionId);
+  return withSessionConnectionLock(sessionId, async () => {
+    const configKey = buildConfigKey(config, dialect);
+    const existing = connectionPools.get(sessionId);
 
-  if (
-    existing &&
-    existing.dialect === dialect &&
-    connectionConfigKeys.get(sessionId) === configKey &&
-    (await isSessionPoolHealthy(existing))
-  ) {
-    return existing;
-  }
-
-  const pending = connectionLocks.get(sessionId);
-  if (pending) {
-    return pending;
-  }
-
-  const createPromise = createFreshConnectionForDialect(sessionId, config, dialect);
-  connectionLocks.set(sessionId, createPromise);
-  try {
-    return await createPromise;
-  } finally {
-    if (connectionLocks.get(sessionId) === createPromise) {
-      connectionLocks.delete(sessionId);
+    if (
+      existing &&
+      existing.dialect === dialect &&
+      connectionConfigKeys.get(sessionId) === configKey &&
+      (await isSessionPoolHealthy(existing))
+    ) {
+      return existing;
     }
-  }
+
+    return createFreshConnectionForDialect(sessionId, config, dialect);
+  });
 }
 
 /** 创建 MySQL 连接池（兼容旧调用方） */
