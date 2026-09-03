@@ -11,6 +11,10 @@ describe("PostgresDialect golden SQL", () => {
     expect(postgresDialect.quoteTable("t_users")).toBe('"t_users"');
   });
 
+  it("quotes schema-qualified tables", () => {
+    expect(postgresDialect.quoteTable("analytics.orders")).toBe('"analytics"."orders"');
+  });
+
   it("builds CONCAT expression", () => {
     expect(postgresDialect.concat(['"a"', '"b"'])).toBe('CONCAT("a", "b")');
     expect(postgresDialect.concat(['"only"'])).toBe('"only"');

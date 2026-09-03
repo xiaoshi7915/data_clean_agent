@@ -131,5 +131,7 @@ export interface OrchestratorContext {
   artifacts?: ExportArtifactsOutput;
   /** 修复轮次（verify_fail 后回环 quality_analyze） */
   repairRound?: number;
+  /** 阶段守卫校验时锁定的 runIndex，供持久化写入使用 */
+  pinnedRunIndex?: number;
   errors: string[];
 }
