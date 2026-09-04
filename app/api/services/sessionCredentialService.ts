@@ -27,9 +27,10 @@ export async function resolveDbConfigInput(
     return resolved;
   }
 
+  // 密码脱敏时仅合并 schema 等非敏感字段，禁止客户端覆盖 host/port/database/username
+  // 否则攻击者可携带 ******** 将真实密码中继到任意主机（凭证外泄）
   return {
     ...resolved,
-    ...config,
-    password: resolved.password,
+    schema: config.schema ?? resolved.schema,
   };
 }
