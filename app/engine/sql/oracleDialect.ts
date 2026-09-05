@@ -9,6 +9,12 @@ export class OracleDialect implements SqlDialect {
   }
 
   quoteTable(table: string): string {
+    const dot = table.indexOf(".");
+    if (dot > 0) {
+      const owner = table.slice(0, dot);
+      const name = table.slice(dot + 1);
+      return `${this.quoteIdentifier(owner)}.${this.quoteIdentifier(name)}`;
+    }
     return this.quoteIdentifier(table);
   }
 

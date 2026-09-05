@@ -102,7 +102,7 @@ export const exploreRouter = createRouter({
       const onProgress = createExploreProgressReporter(input.sessionId);
 
       try {
-        await validatePhaseTransition(input.sessionId, "explore", input.runIndex);
+        const { runIndex } = await validatePhaseTransition(input.sessionId, "explore", input.runIndex);
         const resolvedConfig = await resolveDbConfigInput(input.sessionId, input.config);
         const agentResult = await runSchemaAgent({
           sessionId: input.sessionId,
@@ -130,6 +130,7 @@ export const exploreRouter = createRouter({
           tableName: input.tableName,
           lastAction: "db_explored",
           sessionTitle: `${input.tableName} · 探查完成`,
+          runIndex,
         });
 
         completeExploreProgress(input.sessionId);
@@ -156,7 +157,7 @@ export const exploreRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await validatePhaseTransition(input.sessionId, "explore", input.runIndex);
+        const { runIndex } = await validatePhaseTransition(input.sessionId, "explore", input.runIndex);
         const resolvedPath = resolveExistingUploadPath(input.filePath);
         const fileName = resolvedPath.split("/").pop() ?? "file";
         const agentResult = await runSchemaAgent({
@@ -185,6 +186,7 @@ export const exploreRouter = createRouter({
 
         await persistExploration(input.sessionId, result, {
           lastAction: "file_explored",
+          runIndex,
         });
 
         return { success: true, result };

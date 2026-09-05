@@ -166,10 +166,14 @@ async function loadRun(runId: string): Promise<{ runId: string; sessionId: strin
 }
 
 /** 阶段守卫：进入目标状态前校验会话前置条件 */
-async function assertPhaseGuard(ctx: OrchestratorContext, target: OrchestratorState): Promise<void> {
+async function assertPhaseGuard(
+  ctx: OrchestratorContext,
+  target: OrchestratorState
+): Promise<number | undefined> {
   const action = STATE_PHASE_GUARD[target];
-  if (!action) return;
-  await validatePhaseTransition(ctx.input.sessionId, action);
+  if (!action) return undefined;
+  const { runIndex } = await validatePhaseTransition(ctx.input.sessionId, action);
+  return runIndex;
 }
 
 /** 在目标状态执行对应 Agent 处理器 */
@@ -207,6 +211,7 @@ async function invokeAgentHandler(
         tableName: isFile ? undefined : tableName,
         lastAction: isFile ? "file_explored" : "db_explored",
         sessionTitle: `${tableName} · 探查完成`,
+        runIndex: ctx.pinnedRunIndex,
       });
 
       return {
@@ -232,6 +237,7 @@ async function invokeAgentHandler(
 
       await persistAnalysis(ctx.input.sessionId, result.data.report, result.data.rules, {
         phase: "before",
+        runIndex: ctx.pinnedRunIndex,
       });
 
       return {
@@ -396,7 +402,10 @@ export async function advanceRun(
   }
 
   try {
-    await assertPhaseGuard(ctx, target);
+    const pinnedRunIndex = await assertPhaseGuard(ctx, target);
+    if (pinnedRunIndex != null) {
+      ctx = { ...ctx, pinnedRunIndex };
+    }
   } catch (error) {
     const msg = error instanceof PhaseValidationError ? error.message : String(error);
     ctx = { ...ctx, state: "failed", errors: [...ctx.errors, msg] };
