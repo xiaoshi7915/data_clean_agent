@@ -97,6 +97,16 @@ vi.mock("../services/phaseValidator", () => ({
   PhaseValidationError: class extends Error {},
 }));
 
+vi.mock("../services/sessionCredentialService", () => ({
+  resolveDbConfigInput: vi.fn().mockImplementation(async (_sessionId: string, config?: { password?: string }) => ({
+    host: "127.0.0.1",
+    port: 3306,
+    database: "mydb",
+    username: "root",
+    password: config?.password || "resolved-password",
+  })),
+}));
+
 vi.mock("./schemaAgent", () => ({
   runSchemaAgent: vi.fn().mockResolvedValue({
     success: true,
