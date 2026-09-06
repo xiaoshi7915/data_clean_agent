@@ -28,6 +28,8 @@ import type {
   VerificationResult,
 } from "./types";
 import type { SessionChatContext } from "../services/llmService";
+import { resolveDbConfigInput } from "../services/sessionCredentialService";
+import type { DatabaseDialect } from "@contracts/types";
 import {
   parseAgentPlan,
   type AgentPlanStep,
@@ -188,8 +190,7 @@ async function invokeAgentHandler(
 
   const tableName = ctx.input.tableName ?? session.targetTable ?? "data";
   const databaseName = session.dataSource?.dbConfig?.database ?? "default";
-  const dialect =
-    session.dataSource?.type === "postgresql" ? "postgresql" : "mysql";
+  const dialect = (session.dataSource?.type ?? "mysql") as DatabaseDialect;
 
   switch (state) {
     case "schema_explore": {
@@ -197,10 +198,15 @@ async function invokeAgentHandler(
         return { ...ctx, state: "failed", errors: [...ctx.errors, "未连接数据源"] };
       }
       const isFile = !!session.dataSource.fileConfig;
+      const resolvedDbConfig = session.dataSource.dbConfig
+        ? await resolveDbConfigInput(ctx.input.sessionId, session.dataSource.dbConfig)
+        : undefined;
       const result = await runSchemaAgent({
         sessionId: ctx.input.sessionId,
-        dataSource: session.dataSource,
-        dbConfig: session.dataSource.dbConfig,
+        dataSource: {
+          ...session.dataSource,
+          dbConfig: resolvedDbConfig,
+        },
         tableName,
       });
       if (!result.success || !result.data) {
