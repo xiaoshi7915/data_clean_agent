@@ -3,14 +3,14 @@ import type { CleaningRule, DatabaseDialect, DataSourceConfig } from "@contracts
 import { runSchemaAgent } from "../agents/schemaAgent";
 import { runQualityAgent } from "../agents/qualityAgent";
 import { runRepairAgent } from "../agents/repairAgent";
-import { listDatabaseTables } from "./dataSourceService";
+import { cleanupSession, listDatabaseTables } from "./dataSourceService";
 import { persistExploration, persistAnalysis } from "./explorationPersistenceService";
 import { createSession, updateSessionPhase } from "./sessionService";
 import { resolveDbConfigInput } from "./sessionCredentialService";
 import { getSession } from "./sessionService";
 import { getCurrentRunIndex } from "./pipelineRunService";
 import { getDb } from "../queries/connection";
-import { sqlSteps } from "@db/schema";
+import { cleaningSessions, sqlSteps } from "@db/schema";
 import { isSqlDialectSupported } from "@contracts/dataSourceSupport";
 
 export interface BatchTableResult {
@@ -89,6 +89,21 @@ export async function runBatchPipelineForDatabase(
   }
 
   const dbConfig = await resolveDbConfigInput(sessionId, session.dataSource.dbConfig);
+  const parentRows = await getDb()
+    .select({ dataSourceId: cleaningSessions.dataSourceId })
+    .from(cleaningSessions)
+    .where(eq(cleaningSessions.sessionId, sessionId))
+    .limit(1);
+  const parentDataSourceId = parentRows[0]?.dataSourceId;
+  if (!parentDataSourceId) {
+    throw new Error("整库批量需要已保存的数据源凭证");
+  }
+
+  const resolvedDataSource: DataSourceConfig = {
+    ...(session.dataSource as DataSourceConfig),
+    dbConfig,
+  };
+
   const allTables = await listDatabaseTables(dbConfig, dialect);
   const skip = new Set(options?.skipTables ?? []);
   const maxTables = options?.maxTables ?? 10;
@@ -98,20 +113,21 @@ export async function runBatchPipelineForDatabase(
     .slice(0, maxTables);
 
   const results: BatchTableResult[] = [];
-  const dataSource = session.dataSource as DataSourceConfig;
 
   for (let i = 0; i < tableNames.length; i++) {
     const tableName = tableNames[i];
     options?.onTableStart?.(tableName, i, tableNames.length);
+    let childSessionId: string | undefined;
     try {
-      const childSessionId = await createSession(dataSource, tableName, {
+      childSessionId = await createSession(resolvedDataSource, tableName, {
+        dataSourceId: parentDataSourceId,
         title: `${tableName} · 整库批量`,
         initialPhase: "explore",
       });
 
       const exploreResult = await runSchemaAgent({
         sessionId: childSessionId,
-        dataSource,
+        dataSource: resolvedDataSource,
         tableName,
         limit: 100,
       });
@@ -170,6 +186,10 @@ export async function runBatchPipelineForDatabase(
         success: false,
         error: error instanceof Error ? error.message : String(error),
       });
+    } finally {
+      if (childSessionId) {
+        await cleanupSession(childSessionId);
+      }
     }
   }
 
