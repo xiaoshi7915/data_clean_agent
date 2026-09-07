@@ -9,6 +9,12 @@ export class PostgresDialect implements SqlDialect {
   }
 
   quoteTable(table: string): string {
+    const dot = table.indexOf(".");
+    if (dot > 0) {
+      const schema = table.slice(0, dot);
+      const name = table.slice(dot + 1);
+      return `${this.quoteIdentifier(schema)}.${this.quoteIdentifier(name)}`;
+    }
     return this.quoteIdentifier(table);
   }
 
