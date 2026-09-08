@@ -229,29 +229,34 @@ export async function createConnectionForDialect(
   dialect: DatabaseDialect = "mysql"
 ): Promise<SessionDbPool> {
   const configKey = buildConfigKey(config, dialect);
-  const existing = connectionPools.get(sessionId);
 
-  if (
-    existing &&
-    existing.dialect === dialect &&
-    connectionConfigKeys.get(sessionId) === configKey &&
-    (await isSessionPoolHealthy(existing))
-  ) {
-    return existing;
-  }
+  while (true) {
+    const existing = connectionPools.get(sessionId);
 
-  const pending = connectionLocks.get(sessionId);
-  if (pending) {
-    return pending;
-  }
+    if (
+      existing &&
+      existing.dialect === dialect &&
+      connectionConfigKeys.get(sessionId) === configKey &&
+      (await isSessionPoolHealthy(existing))
+    ) {
+      return existing;
+    }
 
-  const createPromise = createFreshConnectionForDialect(sessionId, config, dialect);
-  connectionLocks.set(sessionId, createPromise);
-  try {
-    return await createPromise;
-  } finally {
-    if (connectionLocks.get(sessionId) === createPromise) {
-      connectionLocks.delete(sessionId);
+    const pending = connectionLocks.get(sessionId);
+    if (pending) {
+      // 等待其他请求建连完成后重新校验配置指纹，避免返回错误数据库的连接池
+      await pending;
+      continue;
+    }
+
+    const createPromise = createFreshConnectionForDialect(sessionId, config, dialect);
+    connectionLocks.set(sessionId, createPromise);
+    try {
+      return await createPromise;
+    } finally {
+      if (connectionLocks.get(sessionId) === createPromise) {
+        connectionLocks.delete(sessionId);
+      }
     }
   }
 }
@@ -595,6 +600,7 @@ export async function exploreDatabase(
       }
 
       if (
+        !useSampleStats &&
         isIdLikeColumn(colName) &&
         stat.uniqueCount < totalRows &&
         stat.nullCount === 0

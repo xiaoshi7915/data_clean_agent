@@ -53,6 +53,7 @@ vi.mock("../queries/connection", () => ({
         }),
       }),
     })),
+    delete: vi.fn().mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) }),
   }),
 }));
 
@@ -90,11 +91,24 @@ vi.mock("../services/sessionService", () => ({
       targetTable: "users_cleaned",
     },
   }),
+  updateSessionPhase: vi.fn().mockResolvedValue(undefined),
+  updateSessionTargetTable: vi.fn().mockResolvedValue(undefined),
+  updateSessionTitle: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../services/phaseValidator", () => ({
-  validatePhaseTransition: vi.fn().mockResolvedValue({}),
+  validatePhaseTransition: vi.fn().mockResolvedValue({ session: {}, runIndex: 1 }),
   PhaseValidationError: class extends Error {},
+}));
+
+vi.mock("../services/sessionCredentialService", () => ({
+  resolveDbConfigInput: vi.fn().mockImplementation(async (_sessionId: string, config?: { password?: string }) => ({
+    host: "127.0.0.1",
+    port: 3306,
+    database: "mydb",
+    username: "root",
+    password: config?.password || "resolved-password",
+  })),
 }));
 
 vi.mock("./schemaAgent", () => ({
