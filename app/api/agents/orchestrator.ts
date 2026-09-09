@@ -28,6 +28,8 @@ import type {
   VerificationResult,
 } from "./types";
 import type { SessionChatContext } from "../services/llmService";
+import { resolveDbConfigInput } from "../services/sessionCredentialService";
+import type { DatabaseDialect } from "@contracts/types";
 import {
   parseAgentPlan,
   type AgentPlanStep,
@@ -166,10 +168,14 @@ async function loadRun(runId: string): Promise<{ runId: string; sessionId: strin
 }
 
 /** 阶段守卫：进入目标状态前校验会话前置条件 */
-async function assertPhaseGuard(ctx: OrchestratorContext, target: OrchestratorState): Promise<void> {
+async function assertPhaseGuard(
+  ctx: OrchestratorContext,
+  target: OrchestratorState
+): Promise<number | undefined> {
   const action = STATE_PHASE_GUARD[target];
-  if (!action) return;
-  await validatePhaseTransition(ctx.input.sessionId, action);
+  if (!action) return undefined;
+  const { runIndex } = await validatePhaseTransition(ctx.input.sessionId, action);
+  return runIndex;
 }
 
 /** 在目标状态执行对应 Agent 处理器 */
@@ -184,8 +190,7 @@ async function invokeAgentHandler(
 
   const tableName = ctx.input.tableName ?? session.targetTable ?? "data";
   const databaseName = session.dataSource?.dbConfig?.database ?? "default";
-  const dialect =
-    session.dataSource?.type === "postgresql" ? "postgresql" : "mysql";
+  const dialect = (session.dataSource?.type ?? "mysql") as DatabaseDialect;
 
   switch (state) {
     case "schema_explore": {
@@ -193,10 +198,15 @@ async function invokeAgentHandler(
         return { ...ctx, state: "failed", errors: [...ctx.errors, "未连接数据源"] };
       }
       const isFile = !!session.dataSource.fileConfig;
+      const resolvedDbConfig = session.dataSource.dbConfig
+        ? await resolveDbConfigInput(ctx.input.sessionId, session.dataSource.dbConfig)
+        : undefined;
       const result = await runSchemaAgent({
         sessionId: ctx.input.sessionId,
-        dataSource: session.dataSource,
-        dbConfig: session.dataSource.dbConfig,
+        dataSource: {
+          ...session.dataSource,
+          dbConfig: resolvedDbConfig,
+        },
         tableName,
       });
       if (!result.success || !result.data) {
@@ -207,6 +217,7 @@ async function invokeAgentHandler(
         tableName: isFile ? undefined : tableName,
         lastAction: isFile ? "file_explored" : "db_explored",
         sessionTitle: `${tableName} · 探查完成`,
+        runIndex: ctx.pinnedRunIndex,
       });
 
       return {
@@ -232,6 +243,7 @@ async function invokeAgentHandler(
 
       await persistAnalysis(ctx.input.sessionId, result.data.report, result.data.rules, {
         phase: "before",
+        runIndex: ctx.pinnedRunIndex,
       });
 
       return {
@@ -253,6 +265,7 @@ async function invokeAgentHandler(
         tableName,
         databaseName,
         columns: session.explorationResult?.schema.map((c) => c.name) ?? [],
+        sourceWhereClause: session.sourceWhereClause,
       });
       if (!result.success || !result.data) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, result.error ?? "SQL 生成失败"] };
@@ -264,11 +277,14 @@ async function invokeAgentHandler(
       if (steps.length === 0) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, "无可校验 SQL 步骤"] };
       }
+      const resolvedVerifyDbConfig = session.dataSource?.dbConfig
+        ? await resolveDbConfigInput(ctx.input.sessionId, session.dataSource.dbConfig)
+        : undefined;
       const result = await runVerifyAgent({
         sessionId: ctx.input.sessionId,
         steps,
         dialect,
-        dbConfig: session.dataSource?.dbConfig,
+        dbConfig: resolvedVerifyDbConfig,
       });
       if (!result.success || !result.data) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, result.error ?? "SQL 校验失败"] };
@@ -396,7 +412,10 @@ export async function advanceRun(
   }
 
   try {
-    await assertPhaseGuard(ctx, target);
+    const pinnedRunIndex = await assertPhaseGuard(ctx, target);
+    if (pinnedRunIndex != null) {
+      ctx = { ...ctx, pinnedRunIndex };
+    }
   } catch (error) {
     const msg = error instanceof PhaseValidationError ? error.message : String(error);
     ctx = { ...ctx, state: "failed", errors: [...ctx.errors, msg] };
