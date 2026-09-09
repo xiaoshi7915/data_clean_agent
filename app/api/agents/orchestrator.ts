@@ -265,6 +265,7 @@ async function invokeAgentHandler(
         tableName,
         databaseName,
         columns: session.explorationResult?.schema.map((c) => c.name) ?? [],
+        sourceWhereClause: session.sourceWhereClause,
       });
       if (!result.success || !result.data) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, result.error ?? "SQL 生成失败"] };
@@ -276,11 +277,14 @@ async function invokeAgentHandler(
       if (steps.length === 0) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, "无可校验 SQL 步骤"] };
       }
+      const resolvedVerifyDbConfig = session.dataSource?.dbConfig
+        ? await resolveDbConfigInput(ctx.input.sessionId, session.dataSource.dbConfig)
+        : undefined;
       const result = await runVerifyAgent({
         sessionId: ctx.input.sessionId,
         steps,
         dialect,
-        dbConfig: session.dataSource?.dbConfig,
+        dbConfig: resolvedVerifyDbConfig,
       });
       if (!result.success || !result.data) {
         return { ...ctx, state: "failed", errors: [...ctx.errors, result.error ?? "SQL 校验失败"] };
