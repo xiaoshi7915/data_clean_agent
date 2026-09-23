@@ -115,7 +115,7 @@ describe("phaseValidator", () => {
     await expect(validatePhaseTransition("sess_1", "explore")).resolves.toBeDefined();
   });
 
-  it("generate 需要至少一条 confirmed 规则", async () => {
+  it("generate 需要已连接数据源", async () => {
     mockedGetFullSession.mockResolvedValue(
       mockFullSession({
         currentPhase: "confirm",
@@ -134,6 +134,8 @@ describe("phaseValidator", () => {
         cleaningRules: [{ ...baseRule, status: "pending" }],
       })
     );
-    await expect(validatePhaseTransition("sess_1", "generate")).rejects.toThrow(/至少确认一条/);
+    const result = await validatePhaseTransition("sess_1", "generate");
+    expect(result.runIndex).toBe(1);
+    expect(result.session.dataSource?.type).toBe("mysql");
   });
 });
