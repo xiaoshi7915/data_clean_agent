@@ -6,6 +6,10 @@ vi.mock("./sessionService", () => ({
   getFullSession: vi.fn(),
 }));
 
+vi.mock("./pipelineRunService", () => ({
+  assertWritableRun: vi.fn().mockResolvedValue(1),
+}));
+
 import { getFullSession } from "./sessionService";
 
 const mockedGetFullSession = vi.mocked(getFullSession);
@@ -110,25 +114,25 @@ describe("phaseValidator", () => {
     await expect(validatePhaseTransition("sess_1", "explore")).resolves.toBeDefined();
   });
 
-  it("generate 需要至少一条 confirmed 规则", async () => {
+  it("generate 需要已连接数据源", async () => {
+    mockedGetFullSession.mockResolvedValue(
+      mockFullSession({
+        currentPhase: "confirm",
+        dataSource: undefined,
+      })
+    );
+    await expect(validatePhaseTransition("sess_1", "generate")).rejects.toThrow(/请先连接数据源/);
+  });
+
+  it("generate 在已连接数据源时通过阶段校验", async () => {
     mockedGetFullSession.mockResolvedValue(
       mockFullSession({
         currentPhase: "confirm",
         dataSource: { type: "mysql", name: "db" },
-        explorationResult: {
-          sourceType: "mysql",
-          sourceName: "t",
-          totalRows: 1,
-          totalCols: 1,
-          schema: [],
-          sampleData: [],
-          columnStats: [],
-          sampleSize: 1,
-          issues: [],
-        },
-        cleaningRules: [{ ...baseRule, status: "pending" }],
       })
     );
-    await expect(validatePhaseTransition("sess_1", "generate")).rejects.toThrow(/至少确认一条/);
+    const result = await validatePhaseTransition("sess_1", "generate");
+    expect(result.runIndex).toBe(1);
+    expect(result.session.dataSource?.type).toBe("mysql");
   });
 });

@@ -101,17 +101,20 @@ describe("appRouter integration", () => {
 
   it("analyze 在有效会话下成功", async () => {
     mockedValidate.mockResolvedValue({
-      sessionId: "sess_1",
-      currentPhase: "explore",
-      dataSource: { type: "mysql", name: "db" },
-      explorationResult: undefined,
-      cleaningRules: [],
-      confirmedRules: [],
-      messages: [],
-      lastAction: "",
-      retryCount: 0,
-      createdAt: "",
-      updatedAt: "",
+      runIndex: 1,
+      session: {
+        sessionId: "sess_1",
+        currentPhase: "explore",
+        dataSource: { type: "mysql", name: "db" },
+        explorationResult: undefined,
+        cleaningRules: [],
+        confirmedRules: [],
+        messages: [],
+        lastAction: "",
+        retryCount: 0,
+        createdAt: "",
+        updatedAt: "",
+      },
     } as never);
 
     const caller = createCaller();
