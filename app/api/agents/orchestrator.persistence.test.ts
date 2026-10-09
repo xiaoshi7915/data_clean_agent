@@ -93,7 +93,7 @@ vi.mock("../services/sessionService", () => ({
 }));
 
 vi.mock("../services/phaseValidator", () => ({
-  validatePhaseTransition: vi.fn().mockResolvedValue({}),
+  validatePhaseTransition: vi.fn().mockResolvedValue({ runIndex: 1, session: {} }),
   PhaseValidationError: class extends Error {},
 }));
 

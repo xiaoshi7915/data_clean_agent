@@ -27,9 +27,11 @@ export async function resolveDbConfigInput(
     return resolved;
   }
 
+  // 密码脱敏时仅允许客户端覆盖 schema（选表），禁止改写 host/库名等以免凭证被中继到恶意库
+  const { schema: clientSchema } = config;
   return {
     ...resolved,
-    ...config,
+    ...(clientSchema !== undefined ? { schema: clientSchema } : {}),
     password: resolved.password,
   };
 }
