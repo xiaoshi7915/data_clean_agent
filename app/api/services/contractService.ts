@@ -72,10 +72,13 @@ export async function saveSessionContractYaml(sessionId: string, yaml: string): 
 /** 从 DB 规则 JSON 重建契约对象（round-trip 读路径） */
 export async function loadContractFromDbRules(sessionId: string): Promise<CleaningContract | null> {
   const db = getDb();
+  const runIndex = await getCurrentRunIndex(sessionId);
   const rows = await db
     .select()
     .from(cleaningRules)
-    .where(eq(cleaningRules.sessionId, sessionId))
+    .where(
+      and(eq(cleaningRules.sessionId, sessionId), eq(cleaningRules.runIndex, runIndex))
+    )
     .orderBy(cleaningRules.ruleIndex);
 
   if (rows.length === 0) return null;
