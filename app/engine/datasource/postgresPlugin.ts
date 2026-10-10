@@ -285,6 +285,7 @@ async function explorePostgresTable(
       }
 
       if (
+        !useSampleStats &&
         isIdLikeColumn(stat.columnName) &&
         stat.uniqueCount < totalRows &&
         stat.nullCount === 0
