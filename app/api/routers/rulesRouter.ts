@@ -32,8 +32,7 @@ export const rulesRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await assertWritableRun(input.sessionId, input.runIndex);
-        const runIndex = input.runIndex ?? (await getCurrentRunIndex(input.sessionId));
+        const runIndex = await assertWritableRun(input.sessionId, input.runIndex);
         const db = getDb();
         await db
           .update(cleaningRules)
@@ -84,8 +83,7 @@ export const rulesRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await assertWritableRun(input.sessionId, input.runIndex);
-        const runIndex = input.runIndex ?? (await getCurrentRunIndex(input.sessionId));
+        const runIndex = await assertWritableRun(input.sessionId, input.runIndex);
         const db = getDb();
         const rows = await db
           .select({ parameters: cleaningRules.parameters })
@@ -138,8 +136,11 @@ export const rulesRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await validatePhaseTransition(input.sessionId, "confirm", input.runIndex);
-        const runIndex = input.runIndex ?? (await getCurrentRunIndex(input.sessionId));
+        const runIndex = await validatePhaseTransition(
+          input.sessionId,
+          "confirm",
+          input.runIndex
+        );
         const db = getDb();
         await db
           .update(cleaningRules)
@@ -198,9 +199,8 @@ export const rulesRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await assertWritableRun(input.sessionId, input.runIndex);
+        const runIndex = await assertWritableRun(input.sessionId, input.runIndex);
         const db = getDb();
-        const runIndex = await getCurrentRunIndex(input.sessionId);
         const existing = await db
           .select({ ruleIndex: cleaningRules.ruleIndex })
           .from(cleaningRules)
@@ -269,8 +269,7 @@ export const rulesRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await assertWritableRun(input.sessionId, input.runIndex);
-        const runIndex = input.runIndex ?? (await getCurrentRunIndex(input.sessionId));
+        const runIndex = await assertWritableRun(input.sessionId, input.runIndex);
         const db = getDb();
         const rows = await db
           .select()
