@@ -32,7 +32,8 @@ export function buildColumnIssues(
   _dataType: string,
   totalRows: number,
   nullCount: number,
-  uniqueCount: number
+  uniqueCount: number,
+  sampleBasedStats = false
 ): DetectedIssue[] {
   const issues: DetectedIssue[] = [];
   const nullRate = totalRows > 0 ? Math.round((nullCount / totalRows) * 10000) / 100 : 0;
@@ -50,7 +51,12 @@ export function buildColumnIssues(
     });
   }
 
-  if (isIdLikeColumn(columnName) && uniqueCount < totalRows && nullCount === 0) {
+  if (
+    !sampleBasedStats &&
+    isIdLikeColumn(columnName) &&
+    uniqueCount < totalRows &&
+    nullCount === 0
+  ) {
     const dupCount = totalRows - uniqueCount;
     issues.push({
       id: `issue_dup_${columnName}`,
