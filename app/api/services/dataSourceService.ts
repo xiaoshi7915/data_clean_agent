@@ -242,7 +242,16 @@ export async function createConnectionForDialect(
 
   const pending = connectionLocks.get(sessionId);
   if (pending) {
-    return pending;
+    await pending;
+    const afterLock = connectionPools.get(sessionId);
+    if (
+      afterLock &&
+      afterLock.dialect === dialect &&
+      connectionConfigKeys.get(sessionId) === configKey &&
+      (await isSessionPoolHealthy(afterLock))
+    ) {
+      return afterLock;
+    }
   }
 
   const createPromise = createFreshConnectionForDialect(sessionId, config, dialect);
@@ -595,6 +604,7 @@ export async function exploreDatabase(
       }
 
       if (
+        !useSampleStats &&
         isIdLikeColumn(colName) &&
         stat.uniqueCount < totalRows &&
         stat.nullCount === 0
