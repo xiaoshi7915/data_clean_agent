@@ -130,11 +130,18 @@ export async function upsertDataSource(config: DataSourceConfig): Promise<string
   const existingId = await findExistingDataSource(config);
 
   if (existingId) {
+    const existing = await getDataSourceById(existingId);
+    const incomingPassword = config.dbConfig?.password;
+    const passwordToStore =
+      existing?.dbConfig && isPasswordMissing(incomingPassword)
+        ? existing.dbConfig.password
+        : incomingPassword;
+
     await db
       .update(savedDataSources)
       .set({
         name: config.name,
-        dbPassword: encryptCredentialForStorage(config.dbConfig?.password),
+        dbPassword: encryptCredentialForStorage(passwordToStore),
         updatedAt: new Date(),
       })
       .where(eq(savedDataSources.dataSourceId, existingId));
