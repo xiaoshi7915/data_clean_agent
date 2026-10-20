@@ -229,29 +229,32 @@ export async function createConnectionForDialect(
   dialect: DatabaseDialect = "mysql"
 ): Promise<SessionDbPool> {
   const configKey = buildConfigKey(config, dialect);
-  const existing = connectionPools.get(sessionId);
 
-  if (
-    existing &&
-    existing.dialect === dialect &&
-    connectionConfigKeys.get(sessionId) === configKey &&
-    (await isSessionPoolHealthy(existing))
-  ) {
-    return existing;
-  }
+  for (;;) {
+    const existing = connectionPools.get(sessionId);
+    if (
+      existing &&
+      existing.dialect === dialect &&
+      connectionConfigKeys.get(sessionId) === configKey &&
+      (await isSessionPoolHealthy(existing))
+    ) {
+      return existing;
+    }
 
-  const pending = connectionLocks.get(sessionId);
-  if (pending) {
-    return pending;
-  }
+    const pending = connectionLocks.get(sessionId);
+    if (pending) {
+      await pending;
+      continue;
+    }
 
-  const createPromise = createFreshConnectionForDialect(sessionId, config, dialect);
-  connectionLocks.set(sessionId, createPromise);
-  try {
-    return await createPromise;
-  } finally {
-    if (connectionLocks.get(sessionId) === createPromise) {
-      connectionLocks.delete(sessionId);
+    const createPromise = createFreshConnectionForDialect(sessionId, config, dialect);
+    connectionLocks.set(sessionId, createPromise);
+    try {
+      return await createPromise;
+    } finally {
+      if (connectionLocks.get(sessionId) === createPromise) {
+        connectionLocks.delete(sessionId);
+      }
     }
   }
 }
@@ -595,6 +598,7 @@ export async function exploreDatabase(
       }
 
       if (
+        !useSampleStats &&
         isIdLikeColumn(colName) &&
         stat.uniqueCount < totalRows &&
         stat.nullCount === 0
