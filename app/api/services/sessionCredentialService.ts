@@ -27,9 +27,10 @@ export async function resolveDbConfigInput(
     return resolved;
   }
 
+  // 脱敏占位密码时，客户端不得覆盖 host/port/database/username，防止用服务端真实密码连向恶意主机
   return {
     ...resolved,
-    ...config,
+    schema: config.schema ?? resolved.schema,
     password: resolved.password,
   };
 }
