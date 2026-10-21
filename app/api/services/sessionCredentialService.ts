@@ -27,9 +27,10 @@ export async function resolveDbConfigInput(
     return resolved;
   }
 
+  // 脱敏密码场景下仅允许客户端覆盖 schema，防止 host/port 等被篡改指向恶意库
   return {
     ...resolved,
-    ...config,
+    schema: config.schema ?? resolved.schema,
     password: resolved.password,
   };
 }
