@@ -212,9 +212,8 @@ export const sqlRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await assertWritableRun(input.sessionId, input.runIndex);
+        const runIndex = await assertWritableRun(input.sessionId, input.runIndex);
         const db = getDb();
-        const runIndex = await getCurrentRunIndex(input.sessionId);
         await db
           .update(sqlSteps)
           .set({ sql: input.newSql })
