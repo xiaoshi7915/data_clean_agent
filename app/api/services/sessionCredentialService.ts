@@ -27,6 +27,14 @@ export async function resolveDbConfigInput(
     return resolved;
   }
 
+  // 脱敏密码表示客户端未重填凭证：仅允许覆盖 schema，禁止改写 host/port/库名/用户名
+  if (isPasswordMissing(config.password)) {
+    return {
+      ...resolved,
+      schema: config.schema ?? resolved.schema,
+    };
+  }
+
   return {
     ...resolved,
     ...config,

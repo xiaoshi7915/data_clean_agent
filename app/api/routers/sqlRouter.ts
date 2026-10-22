@@ -78,8 +78,7 @@ export const sqlRouter = createRouter({
         if (!isSqlDialectSupported(input.dialect)) {
           return { success: false, error: unsupportedDialectMessage(input.dialect), result: null };
         }
-        await validatePhaseTransition(input.sessionId, "generate", input.runIndex);
-        const runIndex = input.runIndex ?? (await getCurrentRunIndex(input.sessionId));
+        const { runIndex } = await validatePhaseTransition(input.sessionId, "generate", input.runIndex);
         const dbRules = await loadRulesForSessionRun(input.sessionId, runIndex);
         const rulesSource =
           dbRules.length > 0
@@ -212,9 +211,8 @@ export const sqlRouter = createRouter({
     )
     .mutation(async ({ input }) => {
       try {
-        await assertWritableRun(input.sessionId, input.runIndex);
+        const runIndex = await assertWritableRun(input.sessionId, input.runIndex);
         const db = getDb();
-        const runIndex = await getCurrentRunIndex(input.sessionId);
         await db
           .update(sqlSteps)
           .set({ sql: input.newSql })
